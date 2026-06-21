@@ -61,6 +61,44 @@ describe('createPreferenceSlice', () => {
     });
   });
 
+  describe('toggleAgentBuilderPanel', () => {
+    it('should toggle agent builder panel without changing chat right panel', () => {
+      const { result } = renderHook(() => useGlobalStore());
+
+      act(() => {
+        useGlobalStore.setState({
+          isStatusInit: true,
+          status: {
+            ...initialState.status,
+            showAgentBuilderPanel: false,
+            showRightPanel: false,
+          },
+        });
+        result.current.toggleAgentBuilderPanel();
+      });
+
+      expect(result.current.status.showAgentBuilderPanel).toBe(true);
+      expect(result.current.status.showRightPanel).toBe(false);
+    });
+
+    it('should set agent builder panel to specified value', () => {
+      const { result } = renderHook(() => useGlobalStore());
+
+      act(() => {
+        useGlobalStore.setState({ isStatusInit: true });
+        result.current.toggleAgentBuilderPanel(true);
+      });
+
+      expect(result.current.status.showAgentBuilderPanel).toBe(true);
+
+      act(() => {
+        result.current.toggleAgentBuilderPanel(false);
+      });
+
+      expect(result.current.status.showAgentBuilderPanel).toBe(false);
+    });
+  });
+
   describe('toggleExpandSessionGroup', () => {
     it('should toggle expand session group', () => {
       const { result } = renderHook(() => useGlobalStore());
@@ -212,28 +250,6 @@ describe('createPreferenceSlice', () => {
       });
 
       expect(result.current.status.mobileShowPortal).toBe(true);
-    });
-  });
-
-  describe('toggleZenMode', () => {
-    it('should toggle zen mode', () => {
-      const { result } = renderHook(() => useGlobalStore());
-
-      act(() => {
-        useGlobalStore.setState({ isStatusInit: true });
-        // 初始值应该是 false
-        expect(result.current.status.zenMode).toBe(false);
-
-        result.current.toggleZenMode();
-      });
-
-      expect(result.current.status.zenMode).toBe(true);
-
-      act(() => {
-        result.current.toggleZenMode();
-      });
-
-      expect(result.current.status.zenMode).toBe(false);
     });
   });
 

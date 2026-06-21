@@ -1,5 +1,4 @@
 import { type MCPToolCallResult } from '@/libs/mcp';
-import { truncateToolResult } from '@/server/utils/truncateToolResult';
 import { useToolStore } from '@/store/tool';
 import { type ChatToolPayload } from '@/types/message';
 import { safeParseJSON } from '@/utils/safeParseJSON';
@@ -35,43 +34,38 @@ const createFailedResult = (
   success: false,
 });
 
-export const klavisExecutor: RemoteToolExecutor = async (p, _context) => {
-  // payload.identifier is now the storage identifier (e.g., 'google-calendar')
+export const composioExecutor: RemoteToolExecutor = async (p, _context) => {
   const identifier = p.identifier;
-  const klavisServers = useToolStore.getState().servers || [];
-  const server = klavisServers.find((s) => s.identifier === identifier);
+  const composioServers = useToolStore.getState().composioServers || [];
+  const server = composioServers.find((s) => s.identifier === identifier);
 
   if (!server) {
-    return createFailedResult(`Klavis server not found: ${identifier}`);
+    return createFailedResult(`Composio server not found: ${identifier}`);
   }
 
-  // Parse arguments
   const args = safeParseJSON(p.arguments) || {};
 
-  // Call Klavis tool via store action
-  const result = await useToolStore.getState().callKlavisTool({
-    serverUrl: server.serverUrl,
+  const result = await useToolStore.getState().callComposioTool({
+    identifier,
     toolArgs: args,
-    toolName: p.apiName,
+    toolSlug: p.apiName,
   });
 
   if (!result.success) {
-    return createFailedResult(result.error || 'Klavis tool execution failed');
+    return createFailedResult(result.error || 'Composio tool execution failed');
   }
 
-  // result.data is MCPToolCallProcessedResult from server
-  // Convert to MCPToolCallResult format
   const toolResult = result.data;
   if (toolResult) {
     return {
-      content: truncateToolResult(toolResult.content),
+      content: toolResult.content,
       error: toolResult.state?.isError ? toolResult.state : undefined,
       state: toolResult.state,
       success: toolResult.success,
     };
   }
 
-  return createFailedResult('Klavis tool returned empty result');
+  return createFailedResult('Composio tool returned empty result');
 };
 
 export const lobehubSkillExecutor: RemoteToolExecutor = async (p, context) => {
@@ -97,8 +91,7 @@ export const lobehubSkillExecutor: RemoteToolExecutor = async (p, context) => {
   }
 
   // Convert to MCPToolCallResult format
-  const rawContent = typeof result.data === 'string' ? result.data : JSON.stringify(result.data);
-  const content = truncateToolResult(rawContent);
+  const content = typeof result.data === 'string' ? result.data : JSON.stringify(result.data);
 
   return {
     content,

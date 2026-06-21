@@ -1,15 +1,17 @@
 'use client';
 
-import { type ReactNode } from 'react';
-import { memo, useCallback } from 'react';
+import type { ReactNode } from 'react';
+import { memo, useCallback, useMemo } from 'react';
 
 import { useFetchAgentDocuments } from '@/hooks/useFetchAgentDocuments';
 import { useFetchTopicMemories } from '@/hooks/useFetchMemoryForTopic';
 import { useFetchNotebookDocuments } from '@/hooks/useFetchNotebookDocuments';
+import { useAgentStore } from '@/store/agent';
 import { useChatStore } from '@/store/chat';
+import { operationSelectors } from '@/store/chat/selectors';
 import { featureFlagsSelectors, useServerConfigStore } from '@/store/serverConfig';
 import { useUserStore } from '@/store/user';
-import { settingsSelectors } from '@/store/user/selectors';
+import { authSelectors, settingsSelectors } from '@/store/user/selectors';
 
 import WideScreenContainer from '../../WideScreenContainer';
 import SkeletonList from '../components/SkeletonList';
@@ -18,6 +20,7 @@ import type { WorkflowExpandLevelDefault } from '../Messages/AssistantGroup/comp
 import { MessageActionProvider } from '../Messages/Contexts/MessageActionProvider';
 import { dataSelectors, useConversationStore } from '../store';
 import AgentSignalReceiptList from './components/AgentSignalReceiptList';
+import RefreshingHint from './components/RefreshingHint';
 import VirtualizedList from './components/VirtualizedList';
 import { useAgentSignalReceipts } from './hooks/useAgentSignalReceipts';
 
@@ -44,6 +47,11 @@ export interface ChatListProps {
    */
   footerSlot?: ReactNode;
   /**
+   * Optional content rendered as the first item inside the virtualized list.
+   * It scrolls with messages and does not participate in conversation state.
+   */
+  headerSlot?: ReactNode;
+  /**
    * Custom item renderer. If not provided, uses default ChatItem.
    */
   itemContent?: (index: number, id: string) => ReactNode;
@@ -66,6 +74,7 @@ const ChatList = memo<ChatListProps>(
     defaultWorkflowExpandLevel,
     disableActionsBar,
     footerSlot,
+    headerSlot,
     welcome,
     itemContent,
     showWelcome,
@@ -78,8 +87,15 @@ const ChatList = memo<ChatListProps>(
       s.useFetchMessages,
     ]);
     const activeAgentId = useChatStore((s) => s.activeAgentId);
+    // Suppress SWR focus revalidate while the current topic is streaming —
+    // the server-pushed UIChatMessage[] snapshot at step boundaries is the
+    // source of truth during that window. A focus refetch could hit DB
+    // mid-fan-out and clobber the in-memory streamed state with a stale
+    // assistant placeholder.
+    const isStreaming = useChatStore(operationSelectors.isAgentRuntimeRunningByContext(context));
     const { enableAgentSelfIteration } = useServerConfigStore(featureFlagsSelectors);
-    useFetchMessages(context, skipFetch);
+    const messagesSWR = useFetchMessages(context, { revalidateOnFocus: !isStreaming, skipFetch });
+    const displayMessages = useConversationStore(dataSelectors.displayMessages);
     const displayMessageIds = useConversationStore(dataSelectors.displayMessageIds);
     const latestMessageId = displayMessageIds.at(-1);
 
@@ -87,14 +103,27 @@ const ChatList = memo<ChatListProps>(
     const isSharePage = !!context.topicShareId;
     // TODO: Migrate Agent Signal receipts behind a dedicated user-visible receipt capability.
     const canShowAgentSignalReceipts = enableAgentSelfIteration === true && !isSharePage;
-    const { receiptsByAnchor, unanchoredReceipts } = useAgentSignalReceipts({
+    const { receiptsByAnchor } = useAgentSignalReceipts({
       agentId: canShowAgentSignalReceipts ? activeAgentId : undefined,
+      displayMessages,
       enabled: canShowAgentSignalReceipts,
       pollingSignal: latestMessageId,
       topicId: canShowAgentSignalReceipts ? context.topicId : undefined,
     });
 
-    // Fetch notebook documents when topic is selected (skip for share pages)
+    // Ensure this conversation's agent config (meta) is loaded into the agent
+    // store, so message author titles resolve via useAgentMeta instead of
+    // falling back to "Untitled Agent". Route-level layouts already init the
+    // active agent, but secondary mounts never do — each Fleet column shows a
+    // different agent, and the share page mounts an arbitrary author's agent;
+    // without this they render "未命名助理".
+    // Idempotent: SWR dedupes against any route-level init by the same key,
+    // and is gated on isLogin (no fetch for anonymous share viewers).
+    const isLogin = useUserStore(authSelectors.isLogin);
+    const useFetchAgentConfig = useAgentStore((s) => s.useFetchAgentConfig);
+    useFetchAgentConfig(isLogin, context.agentId);
+
+    // Fetch conversation context data when a conversation is visible (skip for share pages)
     useFetchAgentDocuments(isSharePage ? undefined : activeAgentId);
     useFetchNotebookDocuments(isSharePage ? undefined : context.topicId!);
     useFetchTopicMemories(enableUserMemories && !isSharePage ? context.topicId : undefined);
@@ -105,13 +134,9 @@ const ChatList = memo<ChatListProps>(
       (index: number, id: string) => {
         const isLatestItem = displayMessageIds.length === index + 1;
         const anchoredReceipts = receiptsByAnchor.get(id) ?? [];
-        const latestUnanchoredReceipts = isLatestItem ? unanchoredReceipts : [];
         const receiptRender =
-          anchoredReceipts.length > 0 || latestUnanchoredReceipts.length > 0 ? (
-            <>
-              <AgentSignalReceiptList receipts={anchoredReceipts} />
-              <AgentSignalReceiptList receipts={latestUnanchoredReceipts} />
-            </>
+          anchoredReceipts.length > 0 ? (
+            <AgentSignalReceiptList receipts={anchoredReceipts} />
           ) : undefined;
 
         return (
@@ -124,9 +149,23 @@ const ChatList = memo<ChatListProps>(
           />
         );
       },
-      [displayMessageIds.length, defaultWorkflowExpandLevel, receiptsByAnchor, unanchoredReceipts],
+      [displayMessageIds.length, defaultWorkflowExpandLevel, receiptsByAnchor],
     );
     const messagesInit = useConversationStore(dataSelectors.messagesInit);
+    // ConversationArea can render store-backed cached messages before SWR has local data.
+    const showRefreshingHint =
+      messagesInit && displayMessageIds.length > 0 && messagesSWR.isValidating && !isStreaming;
+
+    const mergedFooterSlot = useMemo(() => {
+      if (!showRefreshingHint && !footerSlot) return;
+
+      return (
+        <>
+          {showRefreshingHint && <RefreshingHint />}
+          {footerSlot}
+        </>
+      );
+    }, [footerSlot, showRefreshingHint]);
 
     // When topicId is null (new conversation), show welcome directly without waiting for fetch
     // because there's no server data to fetch - only local optimistic updates exist
@@ -156,7 +195,8 @@ const ChatList = memo<ChatListProps>(
       <MessageActionProvider withSingletonActionsBar={!disableActionsBar}>
         <VirtualizedList
           dataSource={displayMessageIds}
-          footerSlot={footerSlot}
+          footerSlot={mergedFooterSlot}
+          headerSlot={headerSlot}
           itemContent={itemContent ?? defaultItemContent}
         />
       </MessageActionProvider>

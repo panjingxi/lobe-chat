@@ -7,13 +7,33 @@ import type {
   ToolExecuteData,
   ToolStartData,
 } from '@lobechat/agent-gateway-client';
-import type { BuiltinToolResult, ChatMessageError, ConversationContext } from '@lobechat/types';
+import type {
+  BuiltinToolResult,
+  ChatMessageError,
+  ConversationContext,
+  UIChatMessage,
+} from '@lobechat/types';
 import { AgentRuntimeErrorType } from '@lobechat/types';
+import { isRecord, pickNonEmptyString, toRecord } from '@lobechat/utils/object';
 
 import { messageService } from '@/services/message';
 import { emitClientAgentSignalSourceEvent } from '@/store/chat/slices/aiChat/actions/agentSignalBridge';
 import type { ChatStore } from '@/store/chat/store';
 import { notifyDesktopHumanApprovalRequired } from '@/store/chat/utils/desktopNotification';
+
+// `agent_runtime_end` reasons that are NOT a clean completion: a mid-stream
+// cancel and a deferred-tool park. These must NOT mark the topic unread, and
+// must take the non-success branch in `onSessionComplete` so the run clears
+// back to 'active' rather than persisting as an unread completion.
+const NON_COMPLETION_RUNTIME_END_REASONS = new Set(['interrupted', 'waiting_for_async_tool']);
+
+/**
+ * Whether an `agent_runtime_end` event represents a clean completion (vs. a
+ * cancel / park). A clean completion is the only ending that should surface an
+ * unread badge.
+ */
+export const isCompletedRuntimeEnd = (reason?: string | null): boolean =>
+  !NON_COMPLETION_RUNTIME_END_REASONS.has(reason ?? '');
 
 // Lazy-loaded to break the import cycle:
 //   gateway.ts → gatewayEventHandler.ts → executors/index.ts (which pulls in
@@ -150,21 +170,103 @@ const findNextAssistantMessageId = (
   }
 };
 
+const isErrorType = (value: unknown): value is ChatMessageError['type'] =>
+  typeof value === 'string' || typeof value === 'number';
+
+const getMessageFromErrorData = (data: unknown): string | undefined => {
+  if (!isRecord(data)) return undefined;
+
+  const message = pickNonEmptyString(data.message);
+  if (message) return message;
+
+  const error = data.error;
+  const errorString = pickNonEmptyString(error);
+  if (errorString) return errorString;
+  if (isRecord(error)) {
+    const errorMessage = pickNonEmptyString(error.message);
+    if (errorMessage) return errorMessage;
+
+    const nestedError = error.error;
+    if (isRecord(nestedError)) {
+      const nestedMessage = pickNonEmptyString(nestedError.message);
+      if (nestedMessage) return nestedMessage;
+    }
+  }
+
+  const responseBody = data._responseBody;
+  const responseBodyMessage = getMessageFromErrorData(responseBody);
+  if (responseBodyMessage) return responseBodyMessage;
+
+  const body = data.body;
+  if (isRecord(body)) {
+    const bodyMessage = pickNonEmptyString(body.message);
+    if (bodyMessage) return bodyMessage;
+  }
+};
+
+const mergeGatewayPayloadError = (
+  sourceBody: Record<string, unknown>,
+  payloadError: unknown,
+): Record<string, unknown> => {
+  if (payloadError === undefined) return sourceBody;
+  if (!('error' in sourceBody)) return { ...sourceBody, error: payloadError };
+  if (isRecord(sourceBody.error) && isRecord(payloadError)) {
+    return { ...sourceBody, error: { ...payloadError, ...sourceBody.error } };
+  }
+  return sourceBody;
+};
+
+const buildGatewayRuntimeErrorBody = (
+  data: Record<string, unknown>,
+  message: string,
+): Record<string, unknown> => {
+  const body = toRecord(data.body);
+  const responseBody = toRecord(data._responseBody);
+  const errorBody = toRecord(data.error);
+  const sourceBody = body ?? responseBody ?? errorBody ?? {};
+  const shouldMergePayloadError = body === undefined && data._responseBody !== undefined;
+  const mergedBody = shouldMergePayloadError
+    ? mergeGatewayPayloadError(sourceBody, data.error)
+    : sourceBody;
+
+  return {
+    ...mergedBody,
+    ...(data.budget === undefined || 'budget' in mergedBody ? {} : { budget: data.budget }),
+    ...(typeof data.provider === 'string' && !('provider' in mergedBody)
+      ? { provider: data.provider }
+      : {}),
+    ...('message' in mergedBody ? {} : { message }),
+  };
+};
+
 const toChatMessageError = (data: unknown): ChatMessageError => {
-  if (typeof data === 'object' && data && 'type' in data && typeof data.type === 'string') {
-    const error = data as ChatMessageError;
+  if (isRecord(data) && isErrorType(data.type)) {
+    const message =
+      typeof data.message === 'string' && data.message
+        ? data.message
+        : getMessageFromErrorData({ body: data.body });
+
     return {
-      ...error,
-      message: error.message || error.body?.message,
+      ...data,
+      ...(message ? { message } : {}),
+      type: data.type,
     };
   }
 
-  const message =
-    typeof data === 'object' && data && 'message' in data && typeof data.message === 'string'
-      ? data.message
-      : typeof data === 'object' && data && 'error' in data && typeof data.error === 'string'
-        ? data.error
-        : 'Unknown error';
+  // Gateway realtime error events can carry the model-runtime payload shape
+  // (`errorType` + `error`) before the terminal DB message is refreshed. Treat
+  // it as the same semantic error instead of falling back to AgentRuntimeError.
+  if (isRecord(data) && isErrorType(data.errorType)) {
+    const message = getMessageFromErrorData(data) || String(data.errorType);
+
+    return {
+      body: buildGatewayRuntimeErrorBody(data, message),
+      message,
+      type: data.errorType,
+    };
+  }
+
+  const message = getMessageFromErrorData(data) || 'Unknown error';
 
   return {
     body: { message },
@@ -214,6 +316,15 @@ export const createGatewayEventHandler = (
   let accumulatedContent = '';
   let accumulatedReasoning = '';
 
+  // Tracks whether any server-confirmed state has actually arrived
+  // (server-assigned assistant id, streamed text/reasoning/tools, or a SoT
+  // uiMessages snapshot). Used by `agent_runtime_end` to decide between
+  // preserving in-memory streamed content (when interrupted MID-stream) vs.
+  // falling back to a DB refetch (when interrupted BEFORE any server state
+  // landed — otherwise the optimistic `tmp_*` placeholder messages stay in
+  // the store indefinitely).
+  let hasStreamedContent = false;
+
   // Active reasoning sub-op id. Mirrors the LLM `StreamingHandler` lifecycle so
   // `isMessageInReasoning(messageId)` (which drives the Thinking UI's
   // "thinking..." title + auto-expand) flips to `true` while thinking is
@@ -248,6 +359,13 @@ export const createGatewayEventHandler = (
   return (event: AgentStreamEvent) => {
     if (terminalState) return;
 
+    // Subagent (`Agent`/`Task`) inner-tool events are tagged `data.subagent` and
+    // belong to an isolation Thread. This handler is main-agent-only, so
+    // dispatching them leaks the subagent's tools into the parent bubble
+    // mid-stream until the terminal fetch corrects it. The local executor drops
+    // them before forwarding; the gateway path doesn't. (DB is unaffected.)
+    if ((event.data as { subagent?: unknown } | undefined)?.subagent) return;
+
     if (event.type === 'agent_runtime_end' || event.type === 'error') {
       terminalState = event.type === 'error' ? 'error' : 'completed';
     }
@@ -264,6 +382,9 @@ export const createGatewayEventHandler = (
             currentAssistantMessageId = newAssistantMessageId;
             // Associate the new message with the operation so UI shows generating state
             get().associateMessageWithOperation(currentAssistantMessageId, operationId);
+            // Server-confirmed assistant id is durable state — preserve it on
+            // interrupt instead of falling back to a placeholder-clobbering refetch.
+            hasStreamedContent = true;
           }
 
           // Close any reasoning op carried over from the previous step.
@@ -276,24 +397,35 @@ export const createGatewayEventHandler = (
           accumulatedContent = '';
           accumulatedReasoning = '';
 
-          // Heterogeneous CLI adapters emit `stream_start { newStep: true }`
-          // without a server-side assistant id. Pull the freshly created step
-          // assistant from DB so subsequent live chunks update the RIGHT row
-          // instead of appending onto the previous step's assistant.
-          const messages = await fetchAndReplaceMessages(get, context).catch((error) => {
-            console.error(error);
-            return undefined;
-          });
+          // Skip the DB read ONLY for native gateway streams — those carry
+          // `assistantMessage.id` directly on stream_start AND the preceding
+          // `step_start` already carried the SoT uiMessages snapshot, so
+          // chunks have a valid target in `dbMessagesMap` already. Removing
+          // the await here is what un-blocks the enqueue chain so live
+          // chunks can land mid-stream.
+          //
+          // Hetero CLI adapters (Claude Code / Codex) never set
+          // `assistantMessage.id` on stream_start, so the DB read stays
+          // mandatory for them — it (a) pulls the executor-created
+          // placeholder into `dbMessagesMap` so subsequent chunks can
+          // dispatch to it, and (b) resolves the next-step assistant id for
+          // the `newStep` fallback.
+          if (!newAssistantMessageId) {
+            const messages = await fetchAndReplaceMessages(get, context).catch((error) => {
+              console.error(error);
+              return undefined;
+            });
 
-          if (!newAssistantMessageId && data?.newStep) {
-            const resolvedAssistantMessageId = findNextAssistantMessageId(
-              messages as GatewayMessageLike[] | undefined,
-              currentAssistantMessageId,
-            );
+            if (data?.newStep) {
+              const resolvedAssistantMessageId = findNextAssistantMessageId(
+                messages as GatewayMessageLike[] | undefined,
+                currentAssistantMessageId,
+              );
 
-            if (resolvedAssistantMessageId) {
-              currentAssistantMessageId = resolvedAssistantMessageId;
-              get().associateMessageWithOperation(currentAssistantMessageId, operationId);
+              if (resolvedAssistantMessageId) {
+                currentAssistantMessageId = resolvedAssistantMessageId;
+                get().associateMessageWithOperation(currentAssistantMessageId, operationId);
+              }
             }
           }
 
@@ -301,7 +433,10 @@ export const createGatewayEventHandler = (
             payload: {
               agentId: context.agentId,
               ...(currentAssistantMessageId
-                ? { assistantMessageId: currentAssistantMessageId }
+                ? {
+                    anchorMessageId: currentAssistantMessageId,
+                    assistantMessageId: currentAssistantMessageId,
+                  }
                 : {}),
               operationId,
               stepIndex: event.stepIndex,
@@ -324,6 +459,7 @@ export const createGatewayEventHandler = (
             // `StreamingHandler.handleText` for the same transition.
             endReasoningIfNeeded();
             accumulatedContent += data.content;
+            hasStreamedContent = true;
             get().internal_dispatchMessage(
               {
                 id: currentAssistantMessageId,
@@ -337,6 +473,7 @@ export const createGatewayEventHandler = (
           if (data.chunkType === 'reasoning' && data.reasoning) {
             startReasoningIfNeeded();
             accumulatedReasoning += data.reasoning;
+            hasStreamedContent = true;
             get().internal_dispatchMessage(
               {
                 id: currentAssistantMessageId,
@@ -349,6 +486,7 @@ export const createGatewayEventHandler = (
 
           if (data.chunkType === 'tools_calling' && data.toolsCalling) {
             endReasoningIfNeeded();
+            hasStreamedContent = true;
             get().internal_dispatchMessage(
               {
                 id: currentAssistantMessageId,
@@ -403,14 +541,37 @@ export const createGatewayEventHandler = (
           pendingToolsCalling?: unknown[];
           phase?: string;
           requiresApproval?: boolean;
+          uiMessages?: UIChatMessage[];
         };
+
+        // The server's stepIndex is the authoritative step counter — mirror it
+        // onto the operation so step-based UI (OpStatusTray) stays correct
+        // even across page-refresh reconnects.
+        if (typeof event.stepIndex === 'number') {
+          get().updateOperationMetadata(operationId, { stepCount: event.stepIndex + 1 });
+        }
+
+        // Server attaches the canonical UIChatMessage[] snapshot at every
+        // step boundary (agent-runtime #15152). Use it as Source of Truth
+        // instead of issuing a DB refetch — the refetch returns a stale
+        // assistant placeholder while DB fan-out is still in flight, which
+        // clobbers the in-memory streamed assistantGroup.
+        if (Array.isArray(data?.uiMessages)) {
+          get().replaceMessages(data.uiMessages, { action: 'gateway/step_start', context });
+        }
 
         if (data?.phase === 'human_approval' && data.requiresApproval && data.pendingToolsCalling) {
           void notifyDesktopHumanApprovalRequired(get, context);
           // Persist a paused marker so the sidebar reflects "waiting on user" across reload.
           // Resume back to 'running' is free: approve / reject both spawn a new op via the
           // executor entries, which already write 'running'.
-          if (context.topicId) void get().updateTopicStatus?.(context.topicId, 'paused');
+          if (context.topicId)
+            void get().updateTopicStatus?.({
+              agentId: context.agentId,
+              groupId: context.groupId,
+              status: 'paused',
+              topicId: context.topicId,
+            });
         }
 
         break;
@@ -466,11 +627,16 @@ export const createGatewayEventHandler = (
 
       case 'agent_runtime_end': {
         enqueue(async () => {
+          const data = event.data as { reason?: string; uiMessages?: UIChatMessage[] } | undefined;
+
           void emitClientAgentSignalSourceEvent({
             payload: {
               agentId: context.agentId,
               ...(currentAssistantMessageId
-                ? { assistantMessageId: currentAssistantMessageId }
+                ? {
+                    anchorMessageId: currentAssistantMessageId,
+                    assistantMessageId: currentAssistantMessageId,
+                  }
                 : {}),
               operationId,
               topicId: context.topicId ?? undefined,
@@ -482,11 +648,60 @@ export const createGatewayEventHandler = (
           endReasoningIfNeeded();
           get().completeOperation(operationId);
 
+          // Only a clean completion surfaces an unread badge — a mid-stream
+          // cancel ('interrupted') or deferred-tool park ('waiting_for_async_tool')
+          // must not. Those endings clear back to 'active' in onSessionComplete.
           const completedOp = get().operations[operationId];
-          if (completedOp?.context.agentId) {
-            get().markUnreadCompleted(completedOp.context.agentId, completedOp.context.topicId);
+          if (completedOp?.context.agentId && isCompletedRuntimeEnd(data?.reason)) {
+            get().markTopicUnread({
+              agentId: completedOp.context.agentId,
+              groupId: completedOp.context.groupId,
+              topicId: completedOp.context.topicId,
+            });
           }
 
+          // Terminal step has no later step_start to carry SoT — server
+          // pushes the canonical snapshot directly on this event. Fall back
+          // to a DB refetch only if the snapshot is absent (older server
+          // builds, or push-event delivery edge cases).
+          if (Array.isArray(data?.uiMessages)) {
+            get().replaceMessages(data.uiMessages, {
+              action: 'gateway/agent_runtime_end',
+              context,
+            });
+          } else if (
+            (data?.reason === 'interrupted' || data?.reason === 'waiting_for_async_tool') &&
+            hasStreamedContent
+          ) {
+            // MID-stream cancel, or a deferred-tool pause
+            // (`waiting_for_async_tool`). The server's
+            // `AgentRuntimeCoordinator.resolveUiMessages` omits uiMessages
+            // for both statuses precisely so we can preserve the
+            // in-memory streamed content here. The executor's partial-
+            // finalize catch writes the real content to DB asynchronously,
+            // but it may not be durable yet — refetching here would race
+            // against that update and clobber the streamed content with
+            // the LOADING_FLAT placeholder. Keep what we have; the next
+            // explicit refresh (route change, user-driven mutate) picks
+            // up the finalized partial content from DB.
+            //
+            // The `hasStreamedContent` guard limits this skip to the case
+            // where server state actually landed (server-assigned assistant
+            // id from stream_start OR any chunk dispatched). If cancel
+            // arrives BEFORE any stream activity, the optimistic `tmp_*`
+            // messages are the only in-memory state and they need the
+            // refetch to be reconciled with the server-side rows.
+          } else {
+            await fetchAndReplaceMessages(get, context).catch(console.error);
+          }
+        });
+        break;
+      }
+
+      case 'notify_update': {
+        // Remote hetero agent (openclaw / hermes) wrote a message to DB via
+        // `lh notify`. DB is the source of truth — just refresh the message list.
+        enqueue(async () => {
           await fetchAndReplaceMessages(get, context).catch(console.error);
         });
         break;

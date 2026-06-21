@@ -1,7 +1,7 @@
 import type * as BusinessConst from '@lobechat/business-const';
 import type * as Const from '@lobechat/const';
 import { cleanup, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import OnBoardingContainer from './index';
@@ -46,11 +46,16 @@ vi.mock('@/hooks/useIsDark', () => ({
 }));
 
 vi.mock('react-i18next', () => ({
-  Trans: ({ values }: { values?: { mode?: string; skip?: string } }) => {
+  Trans: ({ i18nKey, values }: { i18nKey?: string; values?: { mode?: string; skip?: string } }) => {
     const modeText = values?.mode ?? '';
+
+    if (i18nKey === 'agent.layout.switchMessageClassic') {
+      return `Prefer a different setup method? Switch to ${modeText}.`;
+    }
+
     const skipText = values?.skip ?? '';
 
-    return `Not feeling it today? You can switch to ${modeText} or ${skipText}.`;
+    return `Prefer a different setup method? Switch to ${modeText} or ${skipText}.`;
   },
   useTranslation: () => ({
     t: (key: string) => key,
@@ -67,7 +72,7 @@ vi.mock('@/store/serverConfig', () => ({
 
 vi.mock('@/store/user', () => ({
   useUserStore: (selector: (state: Record<string, unknown>) => unknown) =>
-    selector({ finishOnboarding: vi.fn() }),
+    selector({ setOnboardingStep: vi.fn() }),
 }));
 
 const renderAt = (initialPath: string) =>
@@ -106,6 +111,12 @@ describe('OnBoardingContainer', () => {
   it('shows skip-and-switch footer on /onboarding/agent when agent flow is reachable', () => {
     renderAt('/onboarding/agent');
     expect(hasSkipFooter()).toBe(true);
+  });
+
+  it('shows the switch footer without a skip link on /onboarding/classic', () => {
+    renderAt('/onboarding/classic');
+    expect(hasSkipFooter()).toBe(false);
+    expect(screen.getByText((content) => content.includes('Switch to'))).toBeInTheDocument();
   });
 
   it('hides footer when AGENT_ONBOARDING_ENABLED master switch is off', () => {

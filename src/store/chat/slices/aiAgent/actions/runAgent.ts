@@ -118,8 +118,18 @@ export class AgentActionImpl {
 
       case 'agent_runtime_end': {
         // Agent runtime finished - this is the definitive signal that generation is complete
-        const { reason, reasonDetail, finalState } = event.data || {};
+        const { reason, reasonDetail, finalState, uiMessages } = event.data || {};
         log(`Agent runtime ended for ${assistantId}: reason=${reason}, detail=${reasonDetail}`);
+
+        // Server pushes the canonical UIChatMessage[] snapshot for the
+        // topic as the Source of Truth on terminal-state. The last step
+        // has no later step_start to carry a fresh snapshot, so without
+        // this branch the streamed assistantGroup would only be reconciled
+        // with DB once a refetch fires — losing the SoT guarantee.
+        if (Array.isArray(uiMessages)) {
+          log(`Replacing messages from agent_runtime_end uiMessages (${uiMessages.length} msgs)`);
+          this.#get().replaceMessages(uiMessages, { context: operation.context });
+        }
 
         // Update operation metadata with final state
         if (finalState) {
@@ -270,13 +280,29 @@ export class AgentActionImpl {
         // Mark unread completion for background agents
         const op = this.#get().operations[operationId];
         if (op?.context.agentId) {
-          this.#get().markUnreadCompleted(op.context.agentId, op.context.topicId);
+          this.#get().markTopicUnread({
+            agentId: op.context.agentId,
+            groupId: op.context.groupId,
+            topicId: op.context.topicId,
+          });
         }
         break;
       }
 
       case 'step_start': {
-        const { phase, toolCall, pendingToolsCalling, requiresApproval } = event.data || {};
+        const { phase, toolCall, pendingToolsCalling, requiresApproval, uiMessages } =
+          event.data || {};
+
+        // Server attaches the canonical UIChatMessage[] snapshot to
+        // step_start so the client uses the pushed payload as Source of
+        // Truth instead of refetching from DB (the DB fan-out from the
+        // previous step's stream chunks is async — a refetch here would
+        // return a stale assistant placeholder that clobbers the
+        // streamed assistantGroup).
+        if (Array.isArray(uiMessages)) {
+          log(`Replacing messages from step_start uiMessages (${uiMessages.length} msgs)`);
+          this.#get().replaceMessages(uiMessages, { context: operation.context });
+        }
 
         if (phase === 'human_approval' && requiresApproval) {
           // Requires human approval
@@ -301,8 +327,10 @@ export class AgentActionImpl {
 
         if (phase === 'tool_execution' && result) {
           log(`Tool execution completed for ${assistantId} in ${executionTime}ms:`, result);
-          // Refresh messages to display tool results
-          await this.#get().refreshMessages();
+          // Tool results are reconciled via the canonical uiMessages
+          // snapshot the server pushes on the next step_start; no need
+          // to refetch from DB here (the refetch was the source of the
+          // assistantGroup-clobber regression.
         } else if (phase === 'execution_complete' && finalState) {
           // Agent execution complete
           log(`Agent execution completed for ${assistantId}:`, finalState);

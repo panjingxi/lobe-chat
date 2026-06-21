@@ -6,7 +6,7 @@ import { Avatar, Block, Flexbox, Markdown, Tag } from '@lobehub/ui';
 import { createStaticStyles } from 'antd-style';
 import { ArrowRight } from 'lucide-react';
 import { memo, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 
 import type { CreateAgentParams, CreateAgentState } from '../../../types';
 
@@ -42,9 +42,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     color: ${cssVar.colorTextTertiary};
   `,
   container: css`
-    padding: 12px;
-    border-radius: 8px;
-    background: ${cssVar.colorFillQuaternary};
+    padding-block: 4px;
   `,
   field: css`
     margin-block-end: 8px;
@@ -80,9 +78,9 @@ export const CreateAgentRender = memo<BuiltinRenderProps<CreateAgentParams, Crea
     if (pluginState?.success && (pluginState.agentId || pluginState.sessionId)) {
       return (
         <Flexbox
+          horizontal
           align={'center'}
           className={styles.agentCard}
-          horizontal
           gap={12}
           onClick={handleNavigateToSession}
         >

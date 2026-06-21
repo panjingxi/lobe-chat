@@ -4,7 +4,8 @@
   "private": true,
   "exports": {
     ".": "./src/index.ts",
-    "./client": "./src/client/index.ts"
+    "./client": "./src/client/index.ts",
+    "./client/executor": "./src/client/executor/index.ts"
   },
   "main": "./src/index.ts",
   "scripts": {
@@ -14,7 +15,8 @@
   },
   "dependencies": {
     "@lobechat/const": "workspace:*",
-    "@lobechat/prompts": "workspace:*"
+    "@lobechat/prompts": "workspace:*",
+    "@lobechat/utils": "workspace:*"
   },
   "devDependencies": {
     "@lobechat/types": "workspace:*"

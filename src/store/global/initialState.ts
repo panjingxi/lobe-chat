@@ -1,4 +1,4 @@
-import { type NavigateFunction } from 'react-router-dom';
+import { type NavigateFunction } from 'react-router';
 
 import { type MigrationSQL, type MigrationTableItem } from '@/types/clientDB';
 import { DatabaseLoadingState } from '@/types/clientDB';
@@ -22,8 +22,7 @@ export enum SidebarTabKey {
 }
 
 export enum ChatSettingsTabs {
-  Chat = 'chat',
-  Modal = 'modal',
+  Connector = 'connector',
   Opening = 'opening',
   Plugin = 'plugin',
   Prompt = 'prompt',
@@ -53,6 +52,7 @@ export enum SettingsTabs {
   Common = 'common',
   Credits = 'credits',
   Creds = 'creds',
+  Devices = 'devices',
   Hotkey = 'hotkey',
   /** @deprecated Use ServiceModel instead */
   Image = 'image',
@@ -204,8 +204,19 @@ export interface SystemStatus {
     name: number;
     size: number;
   };
+  /**
+   * Visibility of the Agent profile right-side Agent Builder panel.
+   * Independent from `showRightPanel` so builder creation flows do not affect chat pages.
+   */
+  showAgentBuilderPanel?: boolean;
   showCommandMenu?: boolean;
   showFilePanel?: boolean;
+  /**
+   * Collapse state of the nav panel while the Fleet (Observation Mode) view is active.
+   * Persisted independently from `showLeftPanel` so collapsing the running-task list
+   * does not carry over to / from the standard chat nav rail (and vice versa).
+   */
+  showFleetPanel?: boolean;
   showHotkeyHelper?: boolean;
   showImagePanel?: boolean;
   showImageTopicPanel?: boolean;
@@ -275,7 +286,6 @@ export interface SystemStatus {
    * can switch the panel to "review" when revealing the right panel.
    */
   workingSidebarTab?: WorkingSidebarTab;
-  zenMode?: boolean;
 }
 
 export interface GlobalNavigationRef {
@@ -365,9 +375,11 @@ export const INITIAL_STATUS = {
   },
   showCommandMenu: false,
   showFilePanel: true,
+  showFleetPanel: true,
   showHotkeyHelper: false,
   showImagePanel: true,
   showImageTopicPanel: true,
+  showAgentBuilderPanel: false,
   showLeftPanel: true,
   showPageAgentPanel: true,
   showRightPanel: false,
@@ -382,7 +394,6 @@ export const INITIAL_STATUS = {
   videoPanelWidth: 320,
   videoTopicViewMode: 'grid' as const,
   videoTopicPanelWidth: 80,
-  zenMode: false,
 } satisfies SystemStatus;
 
 export const initialState: GlobalState = {

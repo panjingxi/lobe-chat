@@ -20,19 +20,26 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionIcon, Button, Flexbox, Icon, Text, Tooltip } from '@lobehub/ui';
-import { Modal } from '@lobehub/ui/base-ui';
+import { ActionIcon, Flexbox, Icon, Text, Tooltip } from '@lobehub/ui';
+import { Button, createModal, type ModalInstance, useModalContext } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
-import { Eye, EyeOff, GripVertical, PinIcon, RotateCcw } from 'lucide-react';
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { t } from 'i18next';
+import { ArrowDownToLine, Eye, EyeOff, GripVertical, PinIcon, RotateCcw } from 'lucide-react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { create } from 'zustand';
 
+import { useActiveWorkspaceSlug } from '@/business/client/hooks/useActiveWorkspaceSlug';
 import { getRouteById } from '@/config/routes';
 import { useGlobalStore } from '@/store/global';
+import { DEFAULT_HOME_SIDEBAR_EXPANDED_KEYS } from '@/store/global/initialState';
 import { systemStatusSelectors } from '@/store/global/selectors';
-import { SIDEBAR_ACCORDION_KEYS } from '@/store/global/selectors/systemStatus';
+import {
+  DEFAULT_HIDDEN_SECTIONS,
+  DEFAULT_SIDEBAR_ITEMS,
+  SIDEBAR_ACCORDION_KEYS,
+  SIDEBAR_SPACER_ID,
+} from '@/store/global/selectors/systemStatus';
 
 // ---------------------------------------------------------------------------
 // Types & constants
@@ -40,7 +47,7 @@ import { SIDEBAR_ACCORDION_KEYS } from '@/store/global/selectors/systemStatus';
 
 const ACCORDION_GROUP_ID = 'accordion-group';
 
-interface SidebarItemConfig {
+export interface SidebarItemConfig {
   alwaysVisible?: boolean;
   id: string;
   labelKey: string;
@@ -58,24 +65,31 @@ const ALL_SIDEBAR_ITEMS: SidebarItemConfig[] = [
   { id: 'memory', labelKey: 'tab.memory', routeId: 'memory' },
 ];
 
+export const getAvailableSidebarItems = (isWorkspaceMode: boolean): SidebarItemConfig[] =>
+  ALL_SIDEBAR_ITEMS.filter((item) => !(isWorkspaceMode && item.id === 'memory'));
+
+export const getSortableSidebarItemIds = (isWorkspaceMode: boolean): Set<string> =>
+  new Set([...getAvailableSidebarItems(isWorkspaceMode).map((item) => item.id), SIDEBAR_SPACER_ID]);
+
 const ITEM_MAP = new Map(ALL_SIDEBAR_ITEMS.map((item) => [item.id, item]));
 
 const isAccordionKey = (id: string) => SIDEBAR_ACCORDION_KEYS.has(id);
+const isSpacer = (id: string) => id === SIDEBAR_SPACER_ID;
 
-// ---------------------------------------------------------------------------
-// Modal store
-// ---------------------------------------------------------------------------
+const mergeAvailableSidebarItems = (
+  currentItems: string[],
+  nextAvailableItems: string[],
+  availableItemIds: Set<string>,
+): string[] => {
+  let nextAvailableIndex = 0;
+  const nextItems = currentItems.map((id) => {
+    if (!availableItemIds.has(id)) return id;
 
-const useCustomizeSidebarModalStore = create<{
-  open: boolean;
-  setOpen: (open: boolean) => void;
-}>((set) => ({
-  open: false,
-  setOpen: (open) => set({ open }),
-}));
+    return nextAvailableItems[nextAvailableIndex++] ?? id;
+  });
 
-export const openCustomizeSidebarModal = () =>
-  useCustomizeSidebarModalStore.getState().setOpen(true);
+  return [...nextItems, ...nextAvailableItems.slice(nextAvailableIndex)];
+};
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -108,6 +122,17 @@ const styles = createStaticStyles(({ css }) => ({
 
     background: ${cssVar.colorBgElevated};
     box-shadow: ${cssVar.boxShadowSecondary};
+  `,
+  spacerLine: css`
+    flex: 1;
+    block-size: 1px;
+    background: ${cssVar.colorBorderSecondary};
+  `,
+  footer: css`
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    padding-block-start: 16px;
   `,
 }));
 
@@ -177,6 +202,68 @@ const SortableItem = memo<{
 });
 
 // ---------------------------------------------------------------------------
+// SpacerSortableItem — represents the flex spacer slot when it is not bound to
+// the accordion group; draggable like any other item.
+// ---------------------------------------------------------------------------
+
+const SpacerSortableItem = memo(() => {
+  const { t } = useTranslation('common');
+  const {
+    attributes,
+    isDragging,
+    listeners,
+    setActivatorNodeRef,
+    setNodeRef,
+    transform,
+    transition,
+  } = useSortable({ id: SIDEBAR_SPACER_ID });
+
+  return (
+    <Flexbox
+      horizontal
+      align={'center'}
+      className={isDragging ? cx(styles.item, styles.itemDragging) : styles.item}
+      gap={8}
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+      }}
+      {...attributes}
+    >
+      <Flexbox
+        ref={setActivatorNodeRef}
+        style={{ cursor: isDragging ? 'grabbing' : 'grab', flexShrink: 0, touchAction: 'none' }}
+        {...listeners}
+      >
+        <Icon icon={GripVertical} size={14} style={{ color: cssVar.colorTextQuaternary }} />
+      </Flexbox>
+      <Icon icon={ArrowDownToLine} size={14} style={{ color: cssVar.colorTextQuaternary }} />
+      <div className={styles.spacerLine} />
+      <Text style={{ fontSize: 12 }} type={'secondary'}>
+        {t('navPanel.bottomDivider' as any)}
+      </Text>
+      <div className={styles.spacerLine} />
+    </Flexbox>
+  );
+});
+
+const BoundSpacerItem = memo(() => {
+  const { t } = useTranslation('common');
+
+  return (
+    <Flexbox horizontal align={'center'} className={styles.item} gap={8}>
+      <Icon icon={ArrowDownToLine} size={14} style={{ color: cssVar.colorTextQuaternary }} />
+      <div className={styles.spacerLine} />
+      <Text style={{ fontSize: 12 }} type={'secondary'}>
+        {t('navPanel.bottomDivider' as any)}
+      </Text>
+      <div className={styles.spacerLine} />
+    </Flexbox>
+  );
+});
+
+// ---------------------------------------------------------------------------
 // AccordionGroup — a non-draggable slot at the outer level that wraps a nested
 // SortableContext for accordion items. Registers with useSortable so other outer
 // items can reorder relative to its position, but has no drag activator of its own.
@@ -217,6 +304,18 @@ const OverlayItem = memo<{ id: string }>(({ id }) => {
     );
   }
 
+  if (isSpacer(id)) {
+    return (
+      <Flexbox horizontal align={'center'} className={styles.overlay} gap={8}>
+        <Icon icon={GripVertical} size={14} style={{ color: cssVar.colorTextQuaternary }} />
+        <Icon icon={ArrowDownToLine} size={14} style={{ color: cssVar.colorTextQuaternary }} />
+        <Text style={{ fontSize: 12 }} type={'secondary'}>
+          {t('navPanel.bottomDivider' as any)}
+        </Text>
+      </Flexbox>
+    );
+  }
+
   const item = ITEM_MAP.get(id);
   if (!item) return null;
   const route = item.routeId ? getRouteById(item.routeId) : undefined;
@@ -235,30 +334,45 @@ const OverlayItem = memo<{ id: string }>(({ id }) => {
 // ---------------------------------------------------------------------------
 
 /** Flatten outer list (with ACCORDION_GROUP_ID placeholder) + inner accordion items → full list. */
-const flattenItems = (outer: string[], inner: string[]): string[] =>
-  outer.flatMap((id) => (id === ACCORDION_GROUP_ID ? inner : [id]));
+const flattenItems = (outer: string[], inner: string[], bindSpacerToAccordion: boolean): string[] =>
+  outer.flatMap((id) =>
+    id === ACCORDION_GROUP_ID
+      ? [...inner, ...(bindSpacerToAccordion ? [SIDEBAR_SPACER_ID] : [])]
+      : [id],
+  );
 
 const CustomizeSidebarContent = memo(() => {
-  const [storeItems, hiddenSections, updateSystemStatus] = useGlobalStore((s) => [
+  const { close } = useModalContext();
+  const { t: commonT } = useTranslation('common');
+  const [storeItems, storeHiddenSections, updateSystemStatus] = useGlobalStore((s) => [
     systemStatusSelectors.sidebarItems(s),
     systemStatusSelectors.hiddenSidebarSections(s),
     s.updateSystemStatus,
   ]);
+  const isWorkspaceMode = !!useActiveWorkspaceSlug();
+  const sortableItemIds = useMemo(
+    () => getSortableSidebarItemIds(isWorkspaceMode),
+    [isWorkspaceMode],
+  );
+  const filteredStoreItems = useMemo(
+    () => storeItems.filter((id) => sortableItemIds.has(id)),
+    [storeItems, sortableItemIds],
+  );
 
-  // Local state for drag operations — only persisted on dragEnd
-  const [items, setItems] = useState<string[]>(storeItems);
+  // Local draft state — persisted only when the user confirms the modal.
+  const [items, setItems] = useState<string[]>(filteredStoreItems);
+  const [hiddenSections, setHiddenSections] = useState<string[]>(storeHiddenSections);
+  const [shouldResetExpandedKeys, setShouldResetExpandedKeys] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
 
-  // Sync local state when store changes (e.g. reset)
-  useEffect(() => {
-    setItems(storeItems);
-  }, [storeItems]);
-
   // Derive outer (with group placeholder) and inner (accordion items)
-  const { innerItems, outerItems } = useMemo(() => {
+  const { bindSpacerToAccordion, innerItems, outerItems } = useMemo(() => {
+    const hasAccordion = items.some(isAccordionKey);
+    const shouldBindSpacer = hasAccordion && items.includes(SIDEBAR_SPACER_ID);
     const outer: string[] = [];
     const inner: string[] = [];
     let insertedGroup = false;
+
     for (const id of items) {
       if (isAccordionKey(id)) {
         inner.push(id);
@@ -266,11 +380,14 @@ const CustomizeSidebarContent = memo(() => {
           outer.push(ACCORDION_GROUP_ID);
           insertedGroup = true;
         }
+      } else if (isSpacer(id) && shouldBindSpacer) {
+        continue;
       } else {
         outer.push(id);
       }
     }
-    return { innerItems: inner, outerItems: outer };
+
+    return { bindSpacerToAccordion: shouldBindSpacer, innerItems: inner, outerItems: outer };
   }, [items]);
 
   const sensors = useSensors(
@@ -284,10 +401,38 @@ const CustomizeSidebarContent = memo(() => {
       const newHidden = isHidden
         ? hiddenSections.filter((k) => k !== key)
         : [...hiddenSections, key];
-      updateSystemStatus({ hiddenSidebarSections: newHidden });
+      setHiddenSections(newHidden);
     },
-    [hiddenSections, updateSystemStatus],
+    [hiddenSections],
   );
+
+  const handleResetDefault = useCallback(() => {
+    setItems(DEFAULT_SIDEBAR_ITEMS.filter((id) => sortableItemIds.has(id)));
+    setHiddenSections(DEFAULT_HIDDEN_SECTIONS);
+    setShouldResetExpandedKeys(true);
+  }, [sortableItemIds]);
+
+  const handleConfirm = useCallback(() => {
+    updateSystemStatus(
+      {
+        hiddenSidebarSections: hiddenSections,
+        sidebarItems: mergeAvailableSidebarItems(storeItems, items, sortableItemIds),
+        ...(shouldResetExpandedKeys
+          ? { sidebarExpandedKeys: DEFAULT_HOME_SIDEBAR_EXPANDED_KEYS }
+          : {}),
+      },
+      'customizeSidebar',
+    );
+    close();
+  }, [
+    close,
+    hiddenSections,
+    items,
+    shouldResetExpandedKeys,
+    sortableItemIds,
+    storeItems,
+    updateSystemStatus,
+  ]);
 
   // Collision detection: restrict targets to the same container as the active item.
   // - Active in inner (recents/agent) → only collide with inner items
@@ -324,94 +469,98 @@ const CustomizeSidebarContent = memo(() => {
         const oldIdx = innerItems.indexOf(activeKey);
         const newIdx = innerItems.indexOf(overKey);
         if (oldIdx === -1 || newIdx === -1) return;
-        next = flattenItems(outerItems, arrayMove(innerItems, oldIdx, newIdx));
+        next = flattenItems(
+          outerItems,
+          arrayMove(innerItems, oldIdx, newIdx),
+          bindSpacerToAccordion,
+        );
       } else {
         // Outer reorder (pages/community/... or the whole accordion group)
         const oldIdx = outerItems.indexOf(activeKey);
         const newIdx = outerItems.indexOf(overKey);
         if (oldIdx === -1 || newIdx === -1) return;
-        next = flattenItems(arrayMove(outerItems, oldIdx, newIdx), innerItems);
+        next = flattenItems(
+          arrayMove(outerItems, oldIdx, newIdx),
+          innerItems,
+          bindSpacerToAccordion,
+        );
       }
 
       setItems(next);
-      updateSystemStatus({ sidebarItems: next });
     },
-    [innerItems, outerItems, updateSystemStatus],
+    [bindSpacerToAccordion, innerItems, outerItems],
   );
 
   const handleDragCancel = useCallback(() => {
     setActiveId(null);
-    setItems(storeItems);
-  }, [storeItems]);
+  }, []);
 
-  const renderItem = (id: string) => (
-    <SortableItem hiddenSections={hiddenSections} id={id} key={id} onToggle={toggleSection} />
-  );
-
-  return (
-    <DndContext
-      collisionDetection={collisionDetection}
-      sensors={sensors}
-      onDragCancel={handleDragCancel}
-      onDragEnd={handleDragEnd}
-      onDragStart={handleDragStart}
-    >
-      <SortableContext items={outerItems} strategy={verticalListSortingStrategy}>
-        <Flexbox gap={2}>
-          {outerItems.map((id) =>
-            id === ACCORDION_GROUP_ID ? (
-              <AccordionGroup key={id}>
-                <SortableContext items={innerItems} strategy={verticalListSortingStrategy}>
-                  {innerItems.map(renderItem)}
-                </SortableContext>
-              </AccordionGroup>
-            ) : (
-              renderItem(id)
-            ),
-          )}
-        </Flexbox>
-      </SortableContext>
-
-      {createPortal(
-        <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({}) }}>
-          {activeId ? <OverlayItem id={activeId} /> : null}
-        </DragOverlay>,
-        document.body,
-      )}
-    </DndContext>
-  );
-});
-
-// ---------------------------------------------------------------------------
-// Modal wrapper
-// ---------------------------------------------------------------------------
-
-export const CustomizeSidebarModal = memo(() => {
-  const { t } = useTranslation('common');
-  const open = useCustomizeSidebarModalStore((s) => s.open);
-  const setOpen = useCustomizeSidebarModalStore((s) => s.setOpen);
-  const resetSidebarCustomization = useGlobalStore((s) => s.resetSidebarCustomization);
+  const renderItem = (id: string) =>
+    isSpacer(id) ? (
+      <SpacerSortableItem key={id} />
+    ) : (
+      <SortableItem hiddenSections={hiddenSections} id={id} key={id} onToggle={toggleSection} />
+    );
 
   return (
-    <Modal
-      centered
-      destroyOnHidden
-      open={open}
-      title={t('navPanel.customizeSidebar')}
-      width={360}
-      footer={
+    <>
+      <DndContext
+        collisionDetection={collisionDetection}
+        sensors={sensors}
+        onDragCancel={handleDragCancel}
+        onDragEnd={handleDragEnd}
+        onDragStart={handleDragStart}
+      >
+        <SortableContext items={outerItems} strategy={verticalListSortingStrategy}>
+          <Flexbox gap={2}>
+            {outerItems.map((id) =>
+              id === ACCORDION_GROUP_ID ? (
+                <AccordionGroup key={id}>
+                  <SortableContext items={innerItems} strategy={verticalListSortingStrategy}>
+                    {innerItems.map(renderItem)}
+                  </SortableContext>
+                  {bindSpacerToAccordion && <BoundSpacerItem />}
+                </AccordionGroup>
+              ) : (
+                renderItem(id)
+              ),
+            )}
+          </Flexbox>
+        </SortableContext>
+
+        {createPortal(
+          <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({}) }}>
+            {activeId ? <OverlayItem id={activeId} /> : null}
+          </DragOverlay>,
+          document.body,
+        )}
+      </DndContext>
+      <div className={styles.footer}>
         <Button
           block
-          icon={<Icon icon={RotateCcw} />}
-          type={'text'}
-          onClick={resetSidebarCustomization}
+          htmlType="button"
+          icon={<Icon icon={RotateCcw} size={14} />}
+          onClick={handleResetDefault}
         >
-          {t('navPanel.resetDefault' as any)}
+          {commonT('navPanel.resetDefault')}
         </Button>
-      }
-      onCancel={() => setOpen(false)}
-    >
-      <CustomizeSidebarContent />
-    </Modal>
+        <Button block htmlType="button" type="primary" onClick={handleConfirm}>
+          {commonT('confirm')}
+        </Button>
+      </div>
+    </>
   );
 });
+
+// ---------------------------------------------------------------------------
+// Modal entry
+// ---------------------------------------------------------------------------
+
+export const openCustomizeSidebarModal = (): ModalInstance =>
+  createModal({
+    content: <CustomizeSidebarContent />,
+    footer: null,
+    maskClosable: true,
+    title: t('navPanel.customizeSidebar', { ns: 'common' }),
+    width: 360,
+  });

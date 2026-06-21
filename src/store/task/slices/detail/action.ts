@@ -4,6 +4,7 @@ import { t } from 'i18next';
 
 import { message } from '@/components/AntdStaticMethods';
 import { mutate, useClientDataSWR } from '@/libs/swr';
+import { taskKeys } from '@/libs/swr/keys';
 import { taskService } from '@/services/task';
 import type { StoreSetter } from '@/store/types';
 
@@ -19,17 +20,17 @@ type DeletedTask = NonNullable<Awaited<ReturnType<typeof taskService.delete>>['d
 // - model/provider goes through configSlice.updateTaskModelConfig
 // - checkpoint goes through configSlice.updateCheckpoint
 // - review goes through configSlice.updateReview
-// - heartbeat config will get a dedicated action once the upstream infra in LOBE-6587 is complete
+// - heartbeat config will get a dedicated action once the upstream task scheduler infra is complete
 export interface TaskUpdatePayload {
   assigneeAgentId?: string | null;
   description?: string;
+  editorData?: unknown;
   instruction?: string;
   name?: string;
   parentTaskId?: string | null;
   priority?: number;
 }
 
-const FETCH_TASK_DETAIL_KEY = 'fetchTaskDetail';
 const TASK_DETAIL_POLL_INTERVAL = 10_000;
 
 // Poll while the task itself or any topic activity is still in flight, so the
@@ -65,7 +66,12 @@ export class TaskDetailSliceActionImpl {
   addComment = async (
     taskId: string,
     content: string,
-    opts?: { authorAgentId?: string; briefId?: string; topicId?: string },
+    opts?: {
+      authorAgentId?: string;
+      briefId?: string;
+      editorData?: unknown;
+      topicId?: string;
+    },
   ): Promise<Awaited<ReturnType<typeof taskService.addComment>>> => {
     const result = await taskService.addComment(taskId, content, opts);
     await this.internal_refreshTaskDetail(taskId);
@@ -78,8 +84,13 @@ export class TaskDetailSliceActionImpl {
     if (id) await this.internal_refreshTaskDetail(id);
   };
 
-  updateComment = async (commentId: string, content: string, taskId?: string): Promise<void> => {
-    await taskService.updateComment(commentId, content);
+  updateComment = async (
+    commentId: string,
+    content: string,
+    opts?: { editorData?: unknown; taskId?: string },
+  ): Promise<void> => {
+    const { taskId, ...rest } = opts ?? {};
+    await taskService.updateComment(commentId, content, rest);
     const id = taskId ?? this.#get().activeTaskId;
     if (id) await this.internal_refreshTaskDetail(id);
   };
@@ -131,6 +142,7 @@ export class TaskDetailSliceActionImpl {
     automationMode?: 'heartbeat' | 'schedule';
     createdByAgentId?: string;
     description?: string;
+    editorData?: unknown;
     instruction: string;
     name?: string;
     parentTaskId?: string;
@@ -286,7 +298,7 @@ export class TaskDetailSliceActionImpl {
     });
 
     return useClientDataSWR(
-      taskId ? [FETCH_TASK_DETAIL_KEY, taskId] : null,
+      taskId ? taskKeys.detail(taskId) : null,
       async ([, id]: [string, string]) => this.fetchTaskDetail(id),
       { refreshInterval: shouldPoll ? TASK_DETAIL_POLL_INTERVAL : 0 },
     );
@@ -304,7 +316,7 @@ export class TaskDetailSliceActionImpl {
   };
 
   internal_refreshTaskDetail = async (id: string): Promise<void> => {
-    await mutate([FETCH_TASK_DETAIL_KEY, id]);
+    await mutate(taskKeys.detail(id));
   };
 }
 

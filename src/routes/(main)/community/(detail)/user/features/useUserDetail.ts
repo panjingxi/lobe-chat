@@ -1,5 +1,6 @@
 'use client';
 
+import { confirmModal } from '@lobehub/ui/base-ui';
 import { App } from 'antd';
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -8,7 +9,7 @@ import { useMarketAuth } from '@/layout/AuthProvider/MarketAuth';
 import { marketApiService } from '@/services/marketApi';
 import { serverConfigSelectors, useServerConfigStore } from '@/store/serverConfig';
 
-export type AgentStatusAction = 'publish' | 'unpublish' | 'deprecate';
+export type AgentStatusAction = 'deprecate';
 export type EntityType = 'agent' | 'group';
 
 interface UseUserDetailOptions {
@@ -17,7 +18,7 @@ interface UseUserDetailOptions {
 
 export const useUserDetail = ({ onMutate }: UseUserDetailOptions = {}) => {
   const { t } = useTranslation('setting');
-  const { message, modal } = App.useApp();
+  const { message } = App.useApp();
   const { session } = useMarketAuth();
   const enableMarketTrustedClient = useServerConfigStore(
     serverConfigSelectors.enableMarketTrustedClient,
@@ -35,45 +36,14 @@ export const useUserDetail = ({ onMutate }: UseUserDetailOptions = {}) => {
       const successText = t(`myAgents.actions.${action}Success` as any);
       const errorText = t(`myAgents.actions.${action}Error` as any);
 
-      async function executeStatusChange(
-        identifier: string,
-        action: AgentStatusAction,
-        type: EntityType,
-      ) {
+      async function executeStatusChange(identifier: string, type: EntityType) {
         try {
           message.loading({ content: loadingText, key: messageKey });
-          marketApiService.setAccessToken(session!.accessToken);
 
           if (type === 'group') {
-            switch (action) {
-              case 'publish': {
-                await marketApiService.publishAgentGroup(identifier);
-                break;
-              }
-              case 'unpublish': {
-                await marketApiService.unpublishAgentGroup(identifier);
-                break;
-              }
-              case 'deprecate': {
-                await marketApiService.deprecateAgentGroup(identifier);
-                break;
-              }
-            }
+            await marketApiService.deprecateAgentGroup(identifier);
           } else {
-            switch (action) {
-              case 'publish': {
-                await marketApiService.publishAgent(identifier);
-                break;
-              }
-              case 'unpublish': {
-                await marketApiService.unpublishAgent(identifier);
-                break;
-              }
-              case 'deprecate': {
-                await marketApiService.deprecateAgent(identifier);
-                break;
-              }
-            }
+            await marketApiService.deprecateAgent(identifier);
           }
 
           message.success({ content: successText, key: messageKey });
@@ -87,23 +57,18 @@ export const useUserDetail = ({ onMutate }: UseUserDetailOptions = {}) => {
         }
       }
 
-      if (action === 'deprecate') {
-        modal.confirm({
-          cancelText: t('myAgents.actions.cancel'),
-          content: t('myAgents.actions.deprecateConfirmContent'),
-          okButtonProps: { danger: true },
-          okText: t('myAgents.actions.confirmDeprecate'),
-          onOk: async () => {
-            await executeStatusChange(identifier, action, type);
-          },
-          title: t('myAgents.actions.deprecateConfirmTitle'),
-        });
-        return;
-      }
-
-      await executeStatusChange(identifier, action, type);
+      confirmModal({
+        cancelText: t('myAgents.actions.cancel'),
+        content: t('myAgents.actions.deprecateConfirmContent'),
+        okButtonProps: { danger: true },
+        okText: t('myAgents.actions.confirmDeprecate'),
+        onOk: async () => {
+          await executeStatusChange(identifier, type);
+        },
+        title: t('myAgents.actions.deprecateConfirmTitle'),
+      });
     },
-    [enableMarketTrustedClient, session?.accessToken, message, modal, t, onMutate],
+    [enableMarketTrustedClient, session?.accessToken, message, t, onMutate],
   );
 
   return {

@@ -1,4 +1,5 @@
 import { type ModelPerformance, type ModelUsage } from '@lobechat/types';
+import { formatUsageValue } from '@lobechat/utils';
 import { Center, Flexbox, Icon, Popover } from '@lobehub/ui';
 import { Divider } from 'antd';
 import { cssVar } from 'antd-style';
@@ -15,7 +16,7 @@ import { formatNumber, formatShortenNumber } from '@/utils/format';
 import AnimatedNumber from './AnimatedNumber';
 import ModelCard from './ModelCard';
 import type { TokenProgressItem } from './TokenProgress';
-import TokenProgress, { formatUsageValue } from './TokenProgress';
+import TokenProgress from './TokenProgress';
 import { getDetailsToken } from './tokens';
 
 interface TokenDetailProps {
@@ -128,6 +129,10 @@ const TokenDetail = memo<TokenDetailProps>(({ usage, performance, model, provide
       : detailTokens.totalTokens!.token;
 
   const detailTotal = formatUsageValue(totalCount);
+  const cacheRate =
+    typeof detailTokens.inputCacheRate === 'number'
+      ? `${formatNumber(detailTokens.inputCacheRate * 100, 1)}%`
+      : undefined;
 
   const averagePricing = formatNumber(
     detailTokens.totalTokens!.credit / detailTokens.totalTokens!.token,
@@ -181,6 +186,14 @@ const TokenDetail = memo<TokenDetailProps>(({ usage, performance, model, provide
             <Flexbox>
               <TokenProgress showIcon data={totalDetail} />
               <Divider style={{ marginBlock: 8 }} />
+              {cacheRate && (
+                <Flexbox horizontal align={'center'} gap={4} justify={'space-between'}>
+                  <div style={{ color: cssVar.colorTextSecondary }}>
+                    {t('messages.tokenDetails.cacheRate')}
+                  </div>
+                  <div style={{ fontWeight: 500 }}>{cacheRate}</div>
+                </Flexbox>
+              )}
               <Flexbox horizontal align={'center'} gap={4} justify={'space-between'}>
                 <div style={{ color: cssVar.colorTextSecondary }}>
                   {t('messages.tokenDetails.total')}

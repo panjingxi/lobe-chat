@@ -2,6 +2,85 @@
 
 # Changelog
 
+### [Version 2.2.7](https://github.com/lobehub/lobe-chat/compare/v2.2.7-canary.14...v2.2.7)
+
+<sup>Released on **2026-06-20**</sup>
+
+#### 🐛 Bug Fixes
+
+- **chat**: treat parked runs as non-terminal in client run-lifecycle.
+
+<br/>
+
+<details>
+<summary><kbd>Improvements and Fixes</kbd></summary>
+
+#### What's fixed
+
+- **chat**: treat parked runs as non-terminal in client run-lifecycle, closes [#16072](https://github.com/lobehub/lobe-chat/issues/16072) ([db2a62d](https://github.com/lobehub/lobe-chat/commit/db2a62d))
+
+</details>
+
+<div align="right">
+
+[![](https://img.shields.io/badge/-BACK_TO_TOP-151515?style=flat-square)](#readme-top)
+
+</div>
+
+## [Version 2.2.6](https://github.com/lobehub/lobe-chat/compare/v2.2.6-canary.8...v2.2.6)
+
+<sup>Released on **2026-06-17**</sup>
+
+#### ✨ Features
+
+- **agent**: improve connector, document, and fleet workflows.
+
+<br/>
+
+<details>
+<summary><kbd>Improvements and Fixes</kbd></summary>
+
+#### What's improved
+
+- **agent**: improve connector, document, and fleet workflows, closes [#15936](https://github.com/lobehub/lobe-chat/issues/15936) ([3f82033](https://github.com/lobehub/lobe-chat/commit/3f82033))
+
+</details>
+
+<div align="right">
+
+[![](https://img.shields.io/badge/-BACK_TO_TOP-151515?style=flat-square)](#readme-top)
+
+</div>
+
+## [Version 2.2.1](https://github.com/lobehub/lobe-chat/compare/v0.0.0-nightly.pr15228.13999...v2.2.1)
+
+<sup>Released on **2026-05-29**</sup>
+
+#### ✨ Features
+
+- **device**: device registry TRPC (register / list / update / remove).
+- **bot**: add iMessage Desktop setup and bridge.
+- **desktop**: show zoom level HUD on Cmd+/- and Cmd+0.
+
+<br/>
+
+<details>
+<summary><kbd>Improvements and Fixes</kbd></summary>
+
+#### What's improved
+
+- **device**: device registry TRPC (register / list / update / remove), closes [#15299](https://github.com/lobehub/lobe-chat/issues/15299) ([671b252](https://github.com/lobehub/lobe-chat/commit/671b252))
+- **bot**: add iMessage Desktop setup and bridge, closes [#15228](https://github.com/lobehub/lobe-chat/issues/15228) ([6d94635](https://github.com/lobehub/lobe-chat/commit/6d94635))
+- **desktop**: show zoom level HUD on Cmd+/- and Cmd+0, closes [#15294](https://github.com/lobehub/lobe-chat/issues/15294) ([109545c](https://github.com/lobehub/lobe-chat/commit/109545c))
+
+</details>
+
+<div align="right">
+
+[![](https://img.shields.io/badge/-BACK_TO_TOP-151515?style=flat-square)](#readme-top)
+
+</div>
+
 ### [Version 2.2.0](https://github.com/lobehub/lobe-chat/compare/v2.1.59-canary.27...v2.2.0)
 
 <sup>Released on **2026-05-18**</sup>

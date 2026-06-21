@@ -5,8 +5,7 @@ import {
 } from '@lobechat/model-runtime';
 import { uniqBy } from 'es-toolkit/compat';
 import type {
-  AIImageModelCard,
-  AIVideoModelCard,
+  AiFullModelCard,
   EnabledAiModel,
   LobeDefaultAiModelListItem,
   ModelAbilities,
@@ -43,6 +42,7 @@ export type ProviderModelListItem = {
   description?: string;
   displayName: string;
   id: string;
+  knowledgeCutoff?: string;
   parameters?: ModelParamsSchema;
   pricePerImage?: number;
   pricePerVideo?: number;
@@ -51,6 +51,16 @@ export type ProviderModelListItem = {
 };
 
 type ModelNormalizer = (model: EnabledAiModel) => Promise<ProviderModelListItem>;
+
+const getModelProperty = async <T>(
+  model: EnabledAiModel,
+  propertyName: keyof AiFullModelCard,
+): Promise<T | undefined> => {
+  const inlineValue = (model as Partial<AiFullModelCard>)[propertyName];
+  if (inlineValue !== undefined) return inlineValue as T;
+
+  return getModelPropertyWithFallback<T | undefined>(model.id, propertyName, model.providerId);
+};
 
 const dedupeById = (models: ProviderModelListItem[]) => uniqBy(models, 'id');
 
@@ -71,9 +81,10 @@ const createProviderModelCollector = (
 };
 
 export const normalizeChatModel = async (model: EnabledAiModel): Promise<ProviderModelListItem> => {
-  const [description, pricing] = await Promise.all([
-    getModelPropertyWithFallback<string | undefined>(model.id, 'description', model.providerId),
-    getModelPropertyWithFallback<Pricing | undefined>(model.id, 'pricing', model.providerId),
+  const [description, knowledgeCutoff, pricing] = await Promise.all([
+    getModelProperty<string>(model, 'description'),
+    getModelProperty<string>(model, 'knowledgeCutoff'),
+    getModelProperty<Pricing>(model, 'pricing'),
   ]);
 
   return {
@@ -83,6 +94,7 @@ export const normalizeChatModel = async (model: EnabledAiModel): Promise<Provide
     id: model.id,
     releasedAt: model.releasedAt,
     ...(description && { description }),
+    ...(knowledgeCutoff && { knowledgeCutoff }),
     ...(pricing && { pricing }),
   };
 };
@@ -98,16 +110,8 @@ export const normalizeImageModel = async (
         model.providerId,
       );
 
-  const modelWithPricing = model as AIImageModelCard;
-  const fallbackPricingPromise = modelWithPricing.pricing
-    ? Promise.resolve<Pricing | undefined>(modelWithPricing.pricing)
-    : getModelPropertyWithFallback<Pricing | undefined>(model.id, 'pricing', model.providerId);
-
-  const fallbackDescriptionPromise = getModelPropertyWithFallback<string | undefined>(
-    model.id,
-    'description',
-    model.providerId,
-  );
+  const fallbackPricingPromise = getModelProperty<Pricing>(model, 'pricing');
+  const fallbackDescriptionPromise = getModelProperty<string>(model, 'description');
 
   const [fallbackParameters, fallbackPricing, fallbackDescription] = await Promise.all([
     fallbackParametersPromise,
@@ -145,16 +149,8 @@ export const normalizeVideoModel = async (
         model.providerId,
       );
 
-  const modelWithPricing = model as AIVideoModelCard;
-  const fallbackPricingPromise = modelWithPricing.pricing
-    ? Promise.resolve<Pricing | undefined>(modelWithPricing.pricing)
-    : getModelPropertyWithFallback<Pricing | undefined>(model.id, 'pricing', model.providerId);
-
-  const fallbackDescriptionPromise = getModelPropertyWithFallback<string | undefined>(
-    model.id,
-    'description',
-    model.providerId,
-  );
+  const fallbackPricingPromise = getModelProperty<Pricing>(model, 'pricing');
+  const fallbackDescriptionPromise = getModelProperty<string>(model, 'description');
 
   const [fallbackParameters, fallbackPricing, fallbackDescription] = await Promise.all([
     fallbackParametersPromise,
@@ -438,10 +434,7 @@ export class AiProviderActionImpl {
     );
   };
 
-  useFetchAiProviderList = (opts?: {
-    enabled?: boolean;
-    suspense?: boolean;
-  }): SWRResponse<AiProviderListItem[]> => {
+  useFetchAiProviderList = (opts?: { enabled?: boolean }): SWRResponse<AiProviderListItem[]> => {
     return useClientDataSWR<AiProviderListItem[]>(
       opts?.enabled === false ? null : AiProviderSwrKey.fetchAiProviderList,
       () => aiProviderService.getAiProviderList(),
@@ -477,11 +470,15 @@ export class AiProviderActionImpl {
     return useClientDataSWR<AiProviderRuntimeStateWithBuiltinModels | undefined>(
       shouldFetch ? [AiProviderSwrKey.fetchAiProviderRuntimeState, isLogin] : null,
       async ([, isLogin]) => {
-        const [{ LOBE_DEFAULT_MODEL_LIST: builtinAiModelList }, { DEFAULT_MODEL_PROVIDER_LIST }] =
-          await Promise.all([import('model-bank'), import('model-bank/modelProviders')]);
+        const [{ loadModels }, { DEFAULT_MODEL_PROVIDER_LIST }] = await Promise.all([
+          import('@/business/client/model-bank/loadModels'),
+          import('model-bank/modelProviders'),
+        ]);
+        const builtinAiModelList = await loadModels();
 
         if (isLogin) {
           const data = await aiProviderService.getAiProviderRuntimeState();
+
           // Build model lists with proper async handling
           const [enabledChatModelList, enabledImageModelList, enabledVideoModelList] =
             await Promise.all([

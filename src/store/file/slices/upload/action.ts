@@ -1,15 +1,18 @@
 import { LOBE_CHAT_CLOUD } from '@lobechat/business-const';
+import { inferImageMimeTypeFromBytes } from '@lobechat/utils';
 import { t } from 'i18next';
 import { sha256 } from 'js-sha256';
 
-import { message, notification } from '@/components/AntdStaticMethods';
+import { handleFileUploadError } from '@/business/client/handleFileUploadError';
+import { message } from '@/components/AntdStaticMethods';
 import { fileService } from '@/services/file';
 import { uploadService } from '@/services/upload';
 import { type StoreSetter } from '@/store/types';
-import { type FileMetadata, type UploadFileItem } from '@/types/files';
+import { type UploadFileItem } from '@/types/files';
 import { getImageDimensions } from '@/utils/client/imageDimensions';
 
 import { type FileStore } from '../../store';
+import { audioMimeFromExtension } from '../chat/uploadGuard';
 
 type OnStatusUpdate = (
   data:
@@ -46,6 +49,7 @@ interface UploadWithProgressParams {
 interface UploadWithProgressResult {
   dimensions?: {
     height: number;
+    ratio: number;
     width: number;
   };
   filename?: string;
@@ -53,7 +57,31 @@ interface UploadWithProgressResult {
   url: string;
 }
 
+const normalizeUploadedImageFileType = async (
+  file: File,
+  fileArrayBuffer: ArrayBuffer,
+): Promise<File> => {
+  const detectedMimeType = await inferImageMimeTypeFromBytes(fileArrayBuffer);
+
+  if (!detectedMimeType || detectedMimeType === file.type) return file;
+
+  return new File([file], file.name, {
+    lastModified: file.lastModified,
+    type: detectedMimeType,
+  });
+};
+
+type ExistingFileMetadata = Record<string, unknown> & { path?: string };
+
+const normalizeExistingFileMetadata = (metadata: unknown): ExistingFileMetadata => {
+  // Existing hash records can come from generated assets or older upload paths where metadata is null.
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return {};
+
+  return metadata as ExistingFileMetadata;
+};
+
 type Setter = StoreSetter<FileStore>;
+
 export const createFileUploadSlice = (set: Setter, get: () => FileStore, _api?: unknown) =>
   new FileUploadActionImpl(set, get, _api);
 
@@ -67,20 +95,26 @@ export class FileUploadActionImpl {
   uploadBase64FileWithProgress = async (
     base64: string,
   ): Promise<UploadWithProgressResult | undefined> => {
-    // Extract image dimensions from base64 data
-    const dimensions = await getImageDimensions(base64);
+    try {
+      // Extract image dimensions from base64 data
+      const dimensions = await getImageDimensions(base64);
 
-    const { metadata, fileType, size, hash } = await uploadService.uploadBase64ToS3(base64);
+      const { metadata, fileType, size, hash } = await uploadService.uploadBase64ToS3(base64);
 
-    const res = await fileService.createFile({
-      fileType,
-      hash,
-      metadata,
-      name: metadata.filename,
-      size,
-      url: metadata.path,
-    });
-    return { ...res, dimensions, filename: metadata.filename };
+      const res = await fileService.createFile({
+        fileType,
+        hash,
+        metadata: { ...metadata, ...dimensions },
+        name: metadata.filename,
+        size,
+        url: metadata.path,
+      });
+      return { ...res, dimensions, filename: metadata.filename };
+    } catch (error) {
+      if (handleFileUploadError(error)) return;
+
+      throw error;
+    }
   };
 
   uploadWithProgress = async ({
@@ -97,19 +131,20 @@ export class FileUploadActionImpl {
 
     try {
       const fileArrayBuffer = await file.arrayBuffer();
+      const normalizedFile = await normalizeUploadedImageFileType(file, fileArrayBuffer);
 
       // 1. extract image dimensions if applicable
-      const dimensions = await getImageDimensions(file);
+      const dimensions = await getImageDimensions(normalizedFile);
 
       // 2. check file hash
       const hash = sha256(fileArrayBuffer);
 
       const checkStatus = await fileService.checkFileHash(hash);
-      let metadata: FileMetadata;
+      let metadata: ExistingFileMetadata;
 
       // 3. if file exist, just skip upload
       if (checkStatus.isExist) {
-        metadata = checkStatus.metadata as FileMetadata;
+        metadata = normalizeExistingFileMetadata(checkStatus.metadata);
         onStatusUpdate?.({
           id: statusId,
           type: 'updateFile',
@@ -118,14 +153,14 @@ export class FileUploadActionImpl {
       }
       // 3. if file don't exist, need upload files
       else {
-        const { data, success } = await uploadService.uploadFileToS3(file, {
+        const { data, success } = await uploadService.uploadFileToS3(normalizedFile, {
           abortController,
           onNotSupported: () => {
             onStatusUpdate?.({ id: statusId, type: 'removeFile' });
             message.info({
               content: t('upload.fileOnlySupportInServerMode', {
                 cloud: LOBE_CHAT_CLOUD,
-                ext: file.name.split('.').pop(),
+                ext: normalizedFile.name.split('.').pop(),
                 ns: 'error',
               }),
               duration: 5,
@@ -142,30 +177,40 @@ export class FileUploadActionImpl {
         });
         if (!success) return;
 
-        metadata = data;
+        metadata = { ...data };
       }
 
       // 4. use more powerful file type detector to get file type
-      let fileType = file.type;
+      let fileType = normalizedFile.type;
 
-      if (!file.type) {
+      if (!normalizedFile.type) {
         const { fileTypeFromBuffer } = await import('file-type');
 
         const type = await fileTypeFromBuffer(fileArrayBuffer);
         fileType = type?.mime || 'text/plain';
       }
 
+      // Audio containers like .m4a share the ISO-BMFF box with .mp4, so both the browser and
+      // byte-sniffing may report an empty or `video/*` mime. Trust the extension to keep these
+      // classified (and rendered) as audio.
+      const audioMime = audioMimeFromExtension(normalizedFile.name);
+      if (audioMime && !fileType.startsWith('audio/')) fileType = audioMime;
+
       // 5. create file to db
+      // Fall back to the global file URL when legacy/generated metadata has no `path`.
+      const fileUrl = metadata.path || checkStatus.url;
+      if (!fileUrl) throw new Error('File upload failed: missing file url');
+
       const data = await fileService.createFile(
         {
           fileType,
           hash,
-          metadata,
-          name: file.name,
+          metadata: { ...metadata, ...dimensions },
+          name: normalizedFile.name,
           parentId,
-          size: file.size,
+          size: normalizedFile.size,
           source,
-          url: metadata.path || checkStatus.url,
+          url: fileUrl,
         },
         knowledgeBaseId,
       );
@@ -181,17 +226,16 @@ export class FileUploadActionImpl {
         },
       });
 
-      return { ...data, dimensions, filename: file.name };
+      return { ...data, dimensions, filename: normalizedFile.name };
     } catch (error) {
-      // Handle file storage plan limit error
-      if ((error as any)?.message?.includes('beyond the plan limit')) {
-        onStatusUpdate?.({ id: statusId, type: 'removeFile' });
-        notification.error({
-          description: t('upload.storageLimitExceeded', { ns: 'error' }),
-          message: t('upload.uploadFailed', { ns: 'error' }),
-        });
+      if (
+        handleFileUploadError(error, {
+          onUploadBlocked: () => onStatusUpdate?.({ id: statusId, type: 'removeFile' }),
+        })
+      ) {
         return;
       }
+
       throw error;
     }
   };

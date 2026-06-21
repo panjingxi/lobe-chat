@@ -300,7 +300,7 @@ export const GroupAgentBuilderManifest: BuiltinToolManifest = {
           },
           source: {
             description:
-              'Plugin source type: "market" for MCP marketplace plugins, "official" for builtin/Klavis tools',
+              'Plugin source type: "market" for MCP marketplace plugins, "official" for builtin/Composio tools',
             enum: ['market', 'official'],
             type: 'string',
           },
@@ -325,7 +325,7 @@ export const GroupAgentBuilderManifest: BuiltinToolManifest = {
             properties: {
               chatConfig: {
                 description:
-                  'Chat configuration settings (historyCount, enableHistoryCount, enableAutoCreateTopic, etc.)',
+                  'Chat configuration settings (historyCount, enableHistoryCount, enableCompressHistory, etc.)',
                 type: 'object',
               },
               model: {

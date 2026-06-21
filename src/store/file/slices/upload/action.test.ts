@@ -1,7 +1,8 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { message } from '@/components/AntdStaticMethods';
+import { handleFileUploadError } from '@/business/client/handleFileUploadError';
+import { message, notification } from '@/components/AntdStaticMethods';
 import { fileService } from '@/services/file';
 import { uploadService } from '@/services/upload';
 import { getImageDimensions } from '@/utils/client/imageDimensions';
@@ -15,6 +16,13 @@ vi.mock('@/components/AntdStaticMethods', () => ({
   message: {
     info: vi.fn(),
   },
+  notification: {
+    error: vi.fn(),
+  },
+}));
+
+vi.mock('@/business/client/handleFileUploadError', () => ({
+  handleFileUploadError: vi.fn(),
 }));
 
 vi.mock('@/utils/client/imageDimensions', () => ({
@@ -44,6 +52,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(handleFileUploadError).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -56,7 +65,7 @@ describe('FileUploadAction', () => {
       const { result } = renderHook(() => useStore());
 
       const base64Data = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA';
-      const mockDimensions = { height: 100, width: 200 };
+      const mockDimensions = { height: 100, ratio: 2, width: 200 };
       const mockMetadata = {
         date: '12345',
         dirname: '/test',
@@ -88,7 +97,7 @@ describe('FileUploadAction', () => {
       expect(fileService.createFile).toHaveBeenCalledWith({
         fileType: mockUploadResult.fileType,
         hash: mockUploadResult.hash,
-        metadata: mockUploadResult.metadata,
+        metadata: { ...mockUploadResult.metadata, ...mockDimensions },
         name: mockMetadata.filename,
         size: mockUploadResult.size,
         url: mockMetadata.path,
@@ -152,6 +161,37 @@ describe('FileUploadAction', () => {
         }),
       ).rejects.toThrow('Upload failed');
     });
+
+    it('should delegate handled base64 upload errors to the business upload error handler', async () => {
+      const { result } = renderHook(() => useStore());
+
+      const base64Data = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA';
+      const mockMetadata = {
+        date: '12345',
+        dirname: '/test',
+        filename: 'test.png',
+        path: '/test/test.png',
+      };
+
+      vi.mocked(getImageDimensions).mockResolvedValue(undefined);
+      vi.spyOn(uploadService, 'uploadBase64ToS3').mockResolvedValue({
+        fileType: 'image/png',
+        hash: 'mock-hash',
+        metadata: mockMetadata,
+        size: 1024,
+      });
+      const uploadError = new Error('business upload blocked');
+      vi.spyOn(fileService, 'createFile').mockRejectedValue(uploadError);
+      vi.mocked(handleFileUploadError).mockReturnValue(true);
+
+      const uploadResult = await act(async () => {
+        return await result.current.uploadBase64FileWithProgress(base64Data);
+      });
+
+      expect(uploadResult).toBeUndefined();
+      expect(handleFileUploadError).toHaveBeenCalledWith(uploadError);
+      expect(notification.error).not.toHaveBeenCalled();
+    });
   });
 
   describe('uploadWithProgress', () => {
@@ -160,7 +200,7 @@ describe('FileUploadAction', () => {
         const { result } = renderHook(() => useStore());
 
         const mockFile = new File(['test content'], 'test.png', { type: 'image/png' });
-        const mockDimensions = { height: 100, width: 200 };
+        const mockDimensions = { height: 100, ratio: 2, width: 200 };
         const mockExistingMetadata = {
           date: '12345',
           dirname: '/test',
@@ -201,10 +241,57 @@ describe('FileUploadAction', () => {
           {
             fileType: mockFile.type,
             hash: 'mock-hash-value',
-            metadata: mockExistingMetadata,
+            metadata: { ...mockExistingMetadata, ...mockDimensions },
             name: mockFile.name,
             size: mockFile.size,
             url: mockExistingMetadata.path, // Uses metadata.path when available
+          },
+          undefined,
+        );
+        expect(uploadResult).toEqual({
+          ...mockFileResponse,
+          dimensions: mockDimensions,
+          filename: mockFile.name,
+        });
+      });
+
+      it('should reuse the existing hash url when existing metadata is null', async () => {
+        const { result } = renderHook(() => useStore());
+
+        const mockFile = new File(['test content'], 'generated.png', { type: 'image/png' });
+        const mockDimensions = { height: 100, ratio: 2, width: 200 };
+        const mockCheckResult = {
+          isExist: true,
+          metadata: null,
+          url: 'assets/generations/2026-06-19/W4ipNrmH.png',
+        };
+        const mockFileResponse = {
+          id: 'file-id-generated',
+          url: 'https://example.com/generated.png',
+        };
+        const onStatusUpdate = vi.fn();
+
+        vi.mocked(getImageDimensions).mockResolvedValue(mockDimensions);
+        vi.spyOn(fileService, 'checkFileHash').mockResolvedValue(mockCheckResult);
+        vi.spyOn(fileService, 'createFile').mockResolvedValue(mockFileResponse);
+        const uploadToS3Spy = vi.spyOn(uploadService, 'uploadFileToS3');
+
+        const uploadResult = await act(async () => {
+          return await result.current.uploadWithProgress({
+            file: mockFile,
+            onStatusUpdate,
+          });
+        });
+
+        expect(uploadToS3Spy).not.toHaveBeenCalled();
+        expect(fileService.createFile).toHaveBeenCalledWith(
+          {
+            fileType: mockFile.type,
+            hash: 'mock-hash-value',
+            metadata: mockDimensions,
+            name: mockFile.name,
+            size: mockFile.size,
+            url: mockCheckResult.url,
           },
           undefined,
         );
@@ -221,7 +308,7 @@ describe('FileUploadAction', () => {
         const { result } = renderHook(() => useStore());
 
         const mockFile = new File(['test content'], 'newfile.jpg', { type: 'image/jpeg' });
-        const mockDimensions = { height: 150, width: 250 };
+        const mockDimensions = { height: 150, ratio: 1.6667, width: 250 };
         const mockMetadata = {
           date: '12345',
           dirname: '/uploads',
@@ -263,7 +350,7 @@ describe('FileUploadAction', () => {
           {
             fileType: mockFile.type,
             hash: 'mock-hash-value',
-            metadata: mockMetadata,
+            metadata: { ...mockMetadata, ...mockDimensions },
             name: mockFile.name,
             size: mockFile.size,
             url: mockMetadata.path,
@@ -306,13 +393,11 @@ describe('FileUploadAction', () => {
         vi.spyOn(fileService, 'checkFileHash').mockResolvedValue(mockCheckResult);
 
         // Mock uploadFileToS3 to call onProgress
-        vi.spyOn(uploadService, 'uploadFileToS3').mockImplementation(
-          async (file, { onProgress }) => {
-            onProgress?.('uploading', { progress: 50, restTime: 5, speed: 1024 });
-            onProgress?.('success', { progress: 100, restTime: 0, speed: 2048 });
-            return mockUploadResult;
-          },
-        );
+        vi.spyOn(uploadService, 'uploadFileToS3').mockImplementation(async (_, { onProgress }) => {
+          onProgress?.('uploading', { progress: 50, restTime: 5, speed: 1024 });
+          onProgress?.('success', { progress: 100, restTime: 0, speed: 2048 });
+          return mockUploadResult;
+        });
         vi.spyOn(fileService, 'createFile').mockResolvedValue(mockFileResponse);
 
         await act(async () => {
@@ -372,7 +457,7 @@ describe('FileUploadAction', () => {
 
         // Mock uploadFileToS3 to call onNotSupported
         vi.spyOn(uploadService, 'uploadFileToS3').mockImplementation(
-          async (file, { onNotSupported }) => {
+          async (_, { onNotSupported }) => {
             onNotSupported?.();
             return { data: {} as any, success: false };
           },
@@ -422,6 +507,59 @@ describe('FileUploadAction', () => {
         expect(fileService.createFile).toHaveBeenCalledWith(
           expect.objectContaining({
             fileType: 'image/png',
+          }),
+          undefined,
+        );
+      });
+
+      it('should correct image file type from bytes when file.type is wrong', async () => {
+        const { result } = renderHook(() => useStore());
+
+        const pngBytes = new Uint8Array([
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+          0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+          0x15, 0xc4, 0x89,
+        ]);
+        const mockFile = new File([pngBytes], 'mislabelled.jpg', { type: 'image/jpeg' });
+        const mockMetadata = {
+          date: '12345',
+          dirname: '/uploads',
+          filename: 'mislabelled.jpg',
+          path: '/uploads/mislabelled.jpg',
+        };
+        const mockCheckResult = { isExist: false };
+        const mockUploadResult = { data: mockMetadata, success: true };
+        const mockFileResponse = {
+          id: 'file-id-mislabelled',
+          url: 'https://example.com/mislabelled.jpg',
+        };
+        const { fileTypeFromBuffer } = await import('file-type');
+
+        vi.spyOn(mockFile, 'arrayBuffer').mockResolvedValue(pngBytes.buffer);
+        vi.mocked(fileTypeFromBuffer).mockResolvedValue({ ext: 'png', mime: 'image/png' } as any);
+        vi.mocked(getImageDimensions).mockResolvedValue(undefined);
+        vi.spyOn(fileService, 'checkFileHash').mockResolvedValue(mockCheckResult);
+        const uploadSpy = vi
+          .spyOn(uploadService, 'uploadFileToS3')
+          .mockResolvedValue(mockUploadResult);
+        vi.spyOn(fileService, 'createFile').mockResolvedValue(mockFileResponse);
+
+        await act(async () => {
+          await result.current.uploadWithProgress({
+            file: mockFile,
+          });
+        });
+
+        const uploadedFile = uploadSpy.mock.calls[0]?.[0];
+
+        expect(uploadedFile).toBeInstanceOf(File);
+        expect(uploadedFile).not.toBe(mockFile);
+        expect(uploadedFile?.name).toBe('mislabelled.jpg');
+        expect(uploadedFile?.type).toBe('image/png');
+        expect(fileService.createFile).toHaveBeenCalledWith(
+          expect.objectContaining({
+            fileType: 'image/png',
+            name: 'mislabelled.jpg',
           }),
           undefined,
         );
@@ -498,6 +636,74 @@ describe('FileUploadAction', () => {
           expect.objectContaining({
             fileType: 'text/plain',
           }),
+          undefined,
+        );
+      });
+
+      it('should backfill audio mime from extension when byte-sniffing reports video/mp4', async () => {
+        const { result } = renderHook(() => useStore());
+
+        // .m4a shares the ISO-BMFF container with mp4, so file-type may report video/mp4.
+        const mockFile = new File(['test content'], 'voice.m4a', { type: '' });
+        const mockMetadata = {
+          date: '12345',
+          dirname: '/uploads',
+          filename: 'voice.m4a',
+          path: '/uploads/voice.m4a',
+        };
+
+        vi.mocked(getImageDimensions).mockResolvedValue(undefined);
+        vi.spyOn(fileService, 'checkFileHash').mockResolvedValue({ isExist: false });
+        vi.spyOn(uploadService, 'uploadFileToS3').mockResolvedValue({
+          data: mockMetadata,
+          success: true,
+        });
+        vi.spyOn(fileService, 'createFile').mockResolvedValue({
+          id: 'file-id-m4a',
+          url: 'https://example.com/voice.m4a',
+        });
+
+        const { fileTypeFromBuffer } = await import('file-type');
+        vi.mocked(fileTypeFromBuffer).mockResolvedValue({ ext: 'mp4', mime: 'video/mp4' } as any);
+
+        await act(async () => {
+          await result.current.uploadWithProgress({ file: mockFile });
+        });
+
+        expect(fileService.createFile).toHaveBeenCalledWith(
+          expect.objectContaining({ fileType: 'audio/mp4' }),
+          undefined,
+        );
+      });
+
+      it('should keep a correct audio mime reported by the browser', async () => {
+        const { result } = renderHook(() => useStore());
+
+        const mockFile = new File(['test content'], 'voice.m4a', { type: 'audio/x-m4a' });
+        const mockMetadata = {
+          date: '12345',
+          dirname: '/uploads',
+          filename: 'voice.m4a',
+          path: '/uploads/voice.m4a',
+        };
+
+        vi.mocked(getImageDimensions).mockResolvedValue(undefined);
+        vi.spyOn(fileService, 'checkFileHash').mockResolvedValue({ isExist: false });
+        vi.spyOn(uploadService, 'uploadFileToS3').mockResolvedValue({
+          data: mockMetadata,
+          success: true,
+        });
+        vi.spyOn(fileService, 'createFile').mockResolvedValue({
+          id: 'file-id-m4a-2',
+          url: 'https://example.com/voice.m4a',
+        });
+
+        await act(async () => {
+          await result.current.uploadWithProgress({ file: mockFile });
+        });
+
+        expect(fileService.createFile).toHaveBeenCalledWith(
+          expect.objectContaining({ fileType: 'audio/x-m4a' }),
           undefined,
         );
       });
@@ -583,7 +789,7 @@ describe('FileUploadAction', () => {
         const { result } = renderHook(() => useStore());
 
         const mockFile = new File(['image data'], 'image.jpg', { type: 'image/jpeg' });
-        const mockDimensions = { height: 300, width: 400 };
+        const mockDimensions = { height: 300, ratio: 1.3333, width: 400 };
         const mockMetadata = {
           date: '12345',
           dirname: '/images',
@@ -639,8 +845,43 @@ describe('FileUploadAction', () => {
     });
 
     describe('error handling', () => {
+      it('should delegate handled upload errors to the business upload error handler', async () => {
+        const { uploadWithProgress } = useStore.getState();
+
+        const mockFile = new File(['test content'], 'blocked.png', { type: 'image/png' });
+        const mockCheckResult = { isExist: false };
+        const onStatusUpdate = vi.fn();
+        const uploadError = new Error('business upload blocked');
+
+        vi.mocked(getImageDimensions).mockResolvedValue(undefined);
+        vi.spyOn(fileService, 'checkFileHash').mockResolvedValue(mockCheckResult);
+        vi.spyOn(uploadService, 'uploadFileToS3').mockRejectedValue(uploadError);
+        vi.mocked(handleFileUploadError).mockImplementation((_error, options) => {
+          options?.onUploadBlocked?.();
+          return true;
+        });
+
+        const result = await act(async () => {
+          return await uploadWithProgress({
+            file: mockFile,
+            onStatusUpdate,
+          });
+        });
+
+        expect(result).toBeUndefined();
+        expect(onStatusUpdate).toHaveBeenCalledWith({
+          id: mockFile.name,
+          type: 'removeFile',
+        });
+        expect(handleFileUploadError).toHaveBeenCalledWith(
+          uploadError,
+          expect.objectContaining({ onUploadBlocked: expect.any(Function) }),
+        );
+        expect(notification.error).not.toHaveBeenCalled();
+      });
+
       it('should handle checkFileHash errors', async () => {
-        const { result } = renderHook(() => useStore());
+        const { uploadWithProgress } = useStore.getState();
 
         const mockFile = new File(['test content'], 'error.png', { type: 'image/png' });
 
@@ -649,7 +890,7 @@ describe('FileUploadAction', () => {
 
         await expect(
           act(async () => {
-            await result.current.uploadWithProgress({
+            await uploadWithProgress({
               file: mockFile,
             });
           }),
@@ -657,7 +898,7 @@ describe('FileUploadAction', () => {
       });
 
       it('should handle uploadFileToS3 errors', async () => {
-        const { result } = renderHook(() => useStore());
+        const { uploadWithProgress } = useStore.getState();
 
         const mockFile = new File(['test content'], 'error.png', { type: 'image/png' });
         const mockCheckResult = { isExist: false };
@@ -668,7 +909,7 @@ describe('FileUploadAction', () => {
 
         await expect(
           act(async () => {
-            await result.current.uploadWithProgress({
+            await uploadWithProgress({
               file: mockFile,
             });
           }),
@@ -676,7 +917,7 @@ describe('FileUploadAction', () => {
       });
 
       it('should handle createFile errors', async () => {
-        const { result } = renderHook(() => useStore());
+        const { uploadWithProgress } = useStore.getState();
 
         const mockFile = new File(['test content'], 'error.png', { type: 'image/png' });
         const mockMetadata = {
@@ -695,7 +936,7 @@ describe('FileUploadAction', () => {
 
         await expect(
           act(async () => {
-            await result.current.uploadWithProgress({
+            await uploadWithProgress({
               file: mockFile,
             });
           }),

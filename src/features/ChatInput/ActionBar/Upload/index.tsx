@@ -13,6 +13,7 @@ import FileIcon from '@/components/FileIcon';
 import RepoIcon from '@/components/LibIcon';
 import TipGuide from '@/components/TipGuide';
 import { openAttachKnowledgeModal } from '@/features/LibraryModal';
+import { usePermission } from '@/hooks/usePermission';
 import { useVisualMediaUploadAbility } from '@/hooks/useVisualMediaUploadAbility';
 import { useAgentStore } from '@/store/agent';
 import { agentByIdSelectors } from '@/store/agent/selectors';
@@ -22,6 +23,7 @@ import { useUserStore } from '@/store/user';
 import { preferenceSelectors } from '@/store/user/selectors';
 
 import { useAgentId } from '../../hooks/useAgentId';
+import { useChatInputStore } from '../../store';
 import Action from '../components/Action';
 import { type ActionDropdownMenuItems } from '../components/ActionDropdown';
 import CheckboxItem from '../components/CheckboxWithLoading';
@@ -35,6 +37,11 @@ const hotArea = css`
   }
 `;
 
+// Keep every row's leading icon the same width. The menu's icon slot sizes to its
+// content, so a larger file-type icon next to a smaller line icon would widen that
+// slot and push its label out of alignment with the upload / "view more" rows.
+const MENU_ICON_SIZE = 20;
+
 const FileUpload = memo(() => {
   const { t } = useTranslation('chat');
 
@@ -43,12 +50,17 @@ const FileUpload = memo(() => {
   );
 
   const upload = useFileStore((s) => s.uploadChatFiles);
+  const editor = useChatInputStore((s) => s.editor);
 
   const agentId = useAgentId();
   const model = useAgentStore((s) => agentByIdSelectors.getAgentModelById(agentId)(s));
   const provider = useAgentStore((s) => agentByIdSelectors.getAgentModelProviderById(agentId)(s));
 
-  const { canUploadImage, canUploadVideo } = useVisualMediaUploadAbility(model, provider);
+  const { canUploadImage, canUploadVideo, canUploadAudio } = useVisualMediaUploadAbility(
+    model,
+    provider,
+    agentId,
+  );
 
   const [showTip, updateGuideState] = useUserStore((s) => [
     preferenceSelectors.showUploadFileInKnowledgeBaseTip(s),
@@ -68,13 +80,27 @@ const FileUpload = memo(() => {
     s.toggleKnowledgeBase,
   ]);
 
+  // Viewer doesn't have `file:upload` permission — backend would 403.
+  // Render the disabled paperclip with a tooltip so the entry stays visible
+  // (per disabled-not-hidden UX rule), but block the dropdown which would
+  // otherwise let users trigger the upload anyway.
+  const { allowed: canUpload, reason } = usePermission('create_content');
+
   if (!enableKnowledgeBase) return null;
+
+  if (!canUpload) {
+    return (
+      <Tooltip title={reason}>
+        <Action disabled icon={Paperclip} showTooltip={false} title={t('upload.action.tooltip')} />
+      </Tooltip>
+    );
+  }
 
   const uploadItems: ActionDropdownMenuItems = [
     {
       closeOnClick: false,
       disabled: !canUploadImage,
-      icon: ImageUp,
+      icon: <Icon icon={ImageUp} size={MENU_ICON_SIZE} />,
       key: 'upload-image',
       label: canUploadImage ? (
         <Upload
@@ -83,7 +109,8 @@ const FileUpload = memo(() => {
           showUploadList={false}
           beforeUpload={async (file) => {
             setDropdownOpen(false);
-            await upload([file]);
+            editor?.focus();
+            await upload([file], agentId);
 
             return false;
           }}
@@ -98,7 +125,7 @@ const FileUpload = memo(() => {
     },
     {
       closeOnClick: false,
-      icon: FileUp,
+      icon: <Icon icon={FileUp} size={MENU_ICON_SIZE} />,
       key: 'upload-file',
       label: (
         <Upload
@@ -107,7 +134,8 @@ const FileUpload = memo(() => {
           beforeUpload={async (file) => {
             if (
               (file.type.startsWith('image') && !canUploadImage) ||
-              (file.type.startsWith('video') && !canUploadVideo)
+              (file.type.startsWith('video') && !canUploadVideo) ||
+              (file.type.startsWith('audio') && !canUploadAudio)
             )
               return false;
 
@@ -117,13 +145,15 @@ const FileUpload = memo(() => {
               message.error(
                 t('upload.validation.videoSizeExceeded', {
                   actualSize: validation.actualSize,
+                  maxSize: validation.maxSize,
                 }),
               );
               return false;
             }
 
             setDropdownOpen(false);
-            await upload([file]);
+            editor?.focus();
+            await upload([file], agentId);
 
             return false;
           }}
@@ -134,7 +164,7 @@ const FileUpload = memo(() => {
     },
     {
       closeOnClick: false,
-      icon: FolderUp,
+      icon: <Icon icon={FolderUp} size={MENU_ICON_SIZE} />,
       key: 'upload-folder',
       label: (
         <Upload
@@ -144,7 +174,8 @@ const FileUpload = memo(() => {
           beforeUpload={async (file) => {
             if (
               (file.type.startsWith('image') && !canUploadImage) ||
-              (file.type.startsWith('video') && !canUploadVideo)
+              (file.type.startsWith('video') && !canUploadVideo) ||
+              (file.type.startsWith('audio') && !canUploadAudio)
             )
               return false;
 
@@ -154,13 +185,15 @@ const FileUpload = memo(() => {
               message.error(
                 t('upload.validation.videoSizeExceeded', {
                   actualSize: validation.actualSize,
+                  maxSize: validation.maxSize,
                 }),
               );
               return false;
             }
 
             setDropdownOpen(false);
-            await upload([file]);
+            editor?.focus();
+            await upload([file], agentId);
 
             return false;
           }}
@@ -179,7 +212,7 @@ const FileUpload = memo(() => {
       children: [
         // first the files
         ...files.map((item) => ({
-          icon: <FileIcon fileName={item.name} fileType={item.type} size={20} />,
+          icon: <FileIcon fileName={item.name} fileType={item.type} size={MENU_ICON_SIZE} />,
           key: item.id,
           label: (
             <CheckboxItem
@@ -197,7 +230,7 @@ const FileUpload = memo(() => {
 
         // then the knowledge bases
         ...knowledgeBases.map((item) => ({
-          icon: <RepoIcon />,
+          icon: <RepoIcon size={MENU_ICON_SIZE} />,
           key: item.id,
           label: (
             <CheckboxItem
@@ -226,7 +259,7 @@ const FileUpload = memo(() => {
     },
     {
       extra: <Icon icon={ArrowRight} />,
-      icon: LibraryBig,
+      icon: <Icon icon={LibraryBig} size={MENU_ICON_SIZE} />,
       key: 'knowledge-base-store',
       label: t('knowledgeBase.viewMore'),
       onClick: () => {

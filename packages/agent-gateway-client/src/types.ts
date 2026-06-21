@@ -35,6 +35,13 @@ export type AgentStreamEventType =
   | 'agent_intervention_response'
   | 'step_start'
   | 'step_complete'
+  /**
+   * Lightweight invalidation signal emitted by `agentNotify.notify` when a
+   * remote hetero agent (openclaw / hermes) writes a message to DB via
+   * `lh notify`. The frontend reacts by calling `fetchAndReplaceMessages` —
+   * no content is carried in the event itself (DB is the source of truth).
+   */
+  | 'notify_update'
   | 'error';
 
 export interface AgentStreamEvent {
@@ -155,6 +162,12 @@ export interface AuthMessage {
 export interface ResumeMessage {
   lastEventId: string;
   type: 'resume';
+  /**
+   * Opt into the authoritative `resume_complete` reply. Set by
+   * this client so a current gateway hands back the stored session status;
+   * legacy gateways ignore it and replay only.
+   */
+  wantStatus?: boolean;
 }
 
 export interface HeartbeatMessage {
@@ -222,12 +235,37 @@ export interface SessionCompleteMessage {
   type: 'session_complete';
 }
 
+/**
+ * Authoritative session status. Mirrors the gateway DO's `SessionStatus`.
+ */
+export type SessionStatus =
+  | 'running'
+  | 'waiting_input'
+  | 'waiting_confirmation'
+  | 'completed'
+  | 'error'
+  | 'interrupted';
+
+/**
+ * Server → Client: sent right after a `resume` replay, carrying the DO's
+ * authoritative `status` from storage. Because the DO's in-memory event buffer
+ * is wiped by hibernation, an empty replay is ambiguous — the run may still be
+ * alive. This message resolves that ambiguity so the client never guesses
+ * "completed" from silence (which would clear the shared `runningOperation` and
+ * cancel the run on every device).
+ */
+export interface ResumeCompleteMessage {
+  status: SessionStatus;
+  type: 'resume_complete';
+}
+
 export type ServerMessage =
   | AgentEventMessage
   | AuthExpiredMessage
   | AuthFailedMessage
   | AuthSuccessMessage
   | HeartbeatAckMessage
+  | ResumeCompleteMessage
   | SessionCompleteMessage;
 
 // ─── Connection Status ───

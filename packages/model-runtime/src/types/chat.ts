@@ -37,11 +37,16 @@ interface UserMessageContentPartVideo {
   type: 'video_url';
   video_url: { url: string };
 }
+interface UserMessageContentPartAudio {
+  audio_url: { url: string };
+  type: 'audio_url';
+}
 
 export type UserMessageContentPart =
   | UserMessageContentPartText
   | UserMessageContentPartImage
   | UserMessageContentPartVideo
+  | UserMessageContentPartAudio
   | UserMessageContentPartThinking;
 
 export interface OpenAIChatMessage {
@@ -51,6 +56,7 @@ export interface OpenAIChatMessage {
     content?: string;
     duration?: number;
   };
+  reasoning_content?: string;
   role: LLMRoleType;
   tool_call_id?: string;
   tool_calls?: MessageToolCall[];
@@ -84,9 +90,9 @@ export interface ChatStreamPayload {
    */
   imageAspectRatio?: string;
   /**
-   * @title Image resolution for image generation (e.g., '512px', '1K', '2K', '4K')
+   * @title Image resolution for image generation (e.g., '512', '1K', '2K', '4K')
    */
-  imageResolution?: '512px' | '1K' | '2K' | '4K';
+  imageResolution?: '512' | '1K' | '2K' | '4K';
   logprobs?: boolean;
   /**
    * @title Maximum length of generated text
@@ -123,6 +129,7 @@ export interface ChatStreamPayload {
    * @default 0
    */
   presence_penalty?: number;
+  preserveThinking?: boolean;
   provider?: string;
   reasoning?: {
     effort?: string;
@@ -148,7 +155,7 @@ export interface ChatStreamPayload {
    * use for Claude and Gemini
    */
   thinking?: {
-    budget_tokens: number;
+    budget_tokens?: number;
     type?: 'enabled' | 'disabled' | 'adaptive';
   };
   thinkingBudget?: number;
@@ -238,6 +245,25 @@ export interface OnFinishData {
   thinking?: string;
   toolsCalling?: MessageToolCall[];
   usage?: ModelUsage;
+  usageMissingDiagnostics?: UsageMissingDiagnostics;
+}
+
+export interface UsageMissingDiagnostics {
+  apiMode?: 'chat_completions' | 'messages' | 'responses';
+  chunkIndex?: number;
+  finishReason?: string | null;
+  hasUsageMetadata: boolean;
+  includeUsageRequested?: boolean;
+  model?: string;
+  provider?: string;
+  responseId?: string;
+  source:
+    | 'anthropic_messages'
+    | 'google_generative_ai'
+    | 'openai_chat_completions'
+    | 'openai_responses';
+  terminalEventType: string;
+  terminalStatus?: string;
 }
 
 /**

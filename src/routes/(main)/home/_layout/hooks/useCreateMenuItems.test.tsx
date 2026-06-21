@@ -68,7 +68,7 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('react-router-dom', () => ({
+vi.mock('react-router', () => ({
   useNavigate: () => navigateMock,
 }));
 
@@ -122,6 +122,17 @@ vi.mock('@/store/page', () => ({
     selector({
       createNewPage: createNewPageMock,
     }),
+}));
+
+vi.mock('@/store/user', () => ({
+  useUserStore: (selector: (state: Record<string, unknown>) => unknown) =>
+    selector({ preference: { lab: {} } }),
+}));
+
+vi.mock('@/store/user/selectors', () => ({
+  labPreferSelectors: {
+    enablePlatformAgent: () => false,
+  },
 }));
 
 const isActionItem = (

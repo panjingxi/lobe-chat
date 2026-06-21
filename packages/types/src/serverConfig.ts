@@ -7,7 +7,7 @@ import type {
   GlobalLLMProviderKey,
   UserDefaultAgent,
   UserImageConfig,
-  UserSystemAgentConfig,
+  UserServiceModelConfig,
 } from './user/settings';
 
 export type GlobalMemoryLayer = 'activity' | 'context' | 'experience' | 'identity' | 'preference';
@@ -62,12 +62,16 @@ export interface GlobalServerConfig {
   defaultAgent?: PartialDeep<UserDefaultAgent>;
   disableEmailPassword?: boolean;
   enableBusinessFeatures?: boolean;
+  enableComposio?: boolean;
   /**
    * @deprecated
    */
   enabledOAuthSSO?: boolean;
   enableEmailVerification?: boolean;
-  enableKlavis?: boolean;
+  /**
+   * Whether Gateway mode is available for app-level agent execution.
+   */
+  enableGatewayMode?: boolean;
   enableLobehubSkill?: boolean;
   enableMagicLink?: boolean;
   enableMarketTrustedClient?: boolean;
@@ -76,7 +80,7 @@ export interface GlobalServerConfig {
   image?: PartialDeep<UserImageConfig>;
   memory?: GlobalMemoryConfig;
   oAuthSSOProviders?: string[];
-  systemAgent?: PartialDeep<UserSystemAgentConfig>;
+  systemAgent?: PartialDeep<UserServiceModelConfig>;
   telemetry: {
     langfuse?: boolean;
   };

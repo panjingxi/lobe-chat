@@ -1,27 +1,11 @@
 import type { DocumentLoadFormat, DocumentLoadRule } from '@lobechat/agent-templates';
-import {
-  AGENT_DOCUMENT_INJECTION_POSITIONS,
-  type AgentContextDocument,
-} from '@lobechat/context-engine';
+import { type AgentContextDocument } from '@lobechat/context-engine';
 
 import { lambdaClient } from '@/libs/trpc/client';
 import { invalidateDocumentMutation } from '@/services/document/invalidation';
+import { toAgentContextDocuments } from '@/utils/agentDocumentContextMapping';
 
 export { agentDocumentSWRKeys } from '@/services/document/swrKeys';
-
-const VALID_DOCUMENT_POSITIONS = new Set<AgentContextDocument['loadPosition']>(
-  AGENT_DOCUMENT_INJECTION_POSITIONS,
-);
-
-export const normalizeAgentDocumentPosition = (
-  position: string | null | undefined,
-): AgentContextDocument['loadPosition'] | undefined => {
-  if (!position) return undefined;
-
-  return VALID_DOCUMENT_POSITIONS.has(position as AgentContextDocument['loadPosition'])
-    ? (position as AgentContextDocument['loadPosition'])
-    : undefined;
-};
 
 const revalidateAgentDocuments = async (agentId: string) => {
   await invalidateDocumentMutation({ agentId, cause: 'agent-document' });
@@ -61,6 +45,10 @@ class AgentDocumentService {
     return lambdaClient.agentDocument.getDocuments.query(params);
   };
 
+  getContextDocuments = async (params: { agentId: string }) => {
+    return lambdaClient.agentDocument.getContextDocuments.query(params);
+  };
+
   initializeFromTemplate = async (params: { agentId: string; templateSet: string }) => {
     const result = await lambdaClient.agentDocument.initializeFromTemplate.mutate(params);
     await revalidateAgentDocuments(params.agentId);
@@ -70,11 +58,16 @@ class AgentDocumentService {
 
   listDocuments = async (params: {
     agentId: string;
+    includeArchivedToolResults?: boolean;
     scope?: 'agent' | 'currentTopic';
     sourceType?: 'all' | 'file' | 'web';
     topicId?: string;
   }) => {
     return lambdaClient.agentDocument.listDocuments.query(params);
+  };
+
+  getOrCreateChatTopic = async (params: { agentId: string; documentId: string }) => {
+    return lambdaClient.agentDocument.getOrCreateChatTopic.mutate(params);
   };
 
   associateDocument = async (params: { agentId: string; documentId: string }) => {
@@ -289,26 +282,6 @@ class AgentDocumentService {
   };
 }
 
-export const mapAgentDocumentsToContext = (
-  documents: Awaited<ReturnType<AgentDocumentService['getDocuments']>>,
-): AgentContextDocument[] =>
-  documents.map((doc) => ({
-    content: doc.content,
-    description: doc.description ?? undefined,
-    filename: doc.filename,
-    id: doc.id,
-    loadPosition: normalizeAgentDocumentPosition(
-      doc.policy?.context?.position || doc.policyLoadPosition,
-    ),
-    loadRules: doc.loadRules,
-    policyId: doc.templateId,
-    policyLoad: doc.policyLoad as 'always' | 'progressive',
-    policyLoadFormat: doc.policy?.context?.policyLoadFormat || doc.policyLoadFormat || undefined,
-    sourceType: doc.sourceType ?? undefined,
-    title: doc.title,
-    updatedAt: doc.updatedAt ?? undefined,
-  }));
-
 export const resolveAgentDocumentsContext = async (params: {
   agentId?: string;
   cachedDocuments?: AgentContextDocument[];
@@ -318,9 +291,13 @@ export const resolveAgentDocumentsContext = async (params: {
   if (cachedDocuments !== undefined) return cachedDocuments;
   if (!agentId) return undefined;
 
-  const documents = await agentDocumentService.getDocuments({ agentId });
+  const documents = await agentDocumentService.getContextDocuments({ agentId });
 
-  return mapAgentDocumentsToContext(documents);
+  return toAgentContextDocuments(documents);
 };
 
 export const agentDocumentService = new AgentDocumentService();
+
+export type AgentDocumentListItem = Awaited<
+  ReturnType<typeof agentDocumentService.listDocuments>
+>[number];

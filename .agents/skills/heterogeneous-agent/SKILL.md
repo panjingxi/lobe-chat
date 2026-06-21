@@ -1,6 +1,6 @@
 ---
 name: heterogeneous-agent
-description: Guide for implementing and debugging LobeHub heterogeneous agent integrations such as Claude Code, Codex, and future external CLI agents. Use when working on adapter event mapping, Electron IPC transport, renderer persistence, tool-call chaining, subagent threads, resume/session handling, or regressions like mixed multi-tool messages, broken step boundaries, stuck tool loading, and orphan tool messages. Triggers on 'heterogeneous agent', 'hetero agent', '异构 agent', 'claude code adapter', 'codex adapter', 'external agent CLI', '孤立 tool 消息', 'raw Codex trace', or adapter/executor bugs.
+description: 'Implement or debug LobeHub heterogeneous agents. Use for Claude Code/Codex adapters, external CLI agents, event mapping, IPC, persistence, tool-call chains, sessions, traces, or adapter bugs.'
 ---
 
 # Heterogeneous Agent Development
@@ -38,7 +38,7 @@ Use this skill when the bug or feature lives in the external CLI agent pipeline,
 
 ## Default Debug Order
 
-1. Prove whether the raw CLI output is correct before touching UI code.
+1. Prove whether the raw CLI output is correct before touching UI code. The app records every real session — read the most recent one via `cat .heerogeneous-tracing/.last-live-trace` rather than hand-rolling a `claude -p` repro (see references/debug-workflow\.md §2).
 2. If raw output is correct, compare it with adapter output. In dev, `executeHeterogeneousAgent` exposes `window.__HETERO_AGENT_TRACE`.
 3. If adapted events look correct, inspect `persistToolBatch`, `persistToolResult`, step transitions, and subagent routing.
 4. Turn the repro into a focused test before fixing.
@@ -77,6 +77,10 @@ Use this skill when the bug or feature lives in the external CLI agent pipeline,
   look for `tool_result for unknown toolCallId` and missing `result_msg_id` backfill.
 - Subagent tools show up in the main bubble:
   check for subagent chunks reaching the main gateway handler.
+- Wrong terminal-error guide (e.g. "usage limit reached" shown for a network drop):
+  a classifier is branching on a structured field whose mere presence isn't its meaning.
+  Grep the field across all event states in a real trace before trusting it — see
+  references/debug-workflow\.md §8 (CC `rate_limit_info` rides on `status: "allowed"` too).
 
 ## References
 

@@ -5,7 +5,7 @@ import { cssVar } from 'antd-style';
 import { CircleDashed, CircleDot, HandIcon, type LucideIcon } from 'lucide-react';
 import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 
 import type { TaskGroupItem } from '@/store/task/slices/list/initialState';
 
@@ -60,7 +60,11 @@ const StatusGroup = memo<StatusGroupProps>(({ group }) => {
     >
       <Flexbox gap={1} paddingBlock={1}>
         {group.tasks.map((task) => (
-          <TaskItem active={taskId === task.identifier} key={task.id} task={task} />
+          <TaskItem
+            active={taskId === task.identifier || taskId === task.id}
+            key={task.id}
+            task={task}
+          />
         ))}
       </Flexbox>
     </AccordionItem>

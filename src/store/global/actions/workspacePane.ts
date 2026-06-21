@@ -81,6 +81,16 @@ export class GlobalWorkspacePaneActionImpl {
     this.#get().updateSystemStatus({ showLeftPanel }, n('toggleLeftPanel', newValue));
   };
 
+  toggleAgentBuilderPanel = (newValue?: boolean): void => {
+    const showAgentBuilderPanel =
+      typeof newValue === 'boolean' ? newValue : !this.#get().status.showAgentBuilderPanel;
+
+    this.#get().updateSystemStatus(
+      { showAgentBuilderPanel },
+      n('toggleAgentBuilderPanel', newValue),
+    );
+  };
+
   togglePageAgentPanel = (newValue?: boolean): void => {
     const showPageAgentPanel =
       typeof newValue === 'boolean' ? newValue : !this.#get().status.showPageAgentPanel;
@@ -141,13 +151,6 @@ export class GlobalWorkspacePaneActionImpl {
       typeof newValue === 'boolean' ? !newValue : !this.#get().status.noWideScreen;
 
     this.#get().updateSystemStatus({ noWideScreen }, n('toggleWideScreen', newValue));
-  };
-
-  toggleZenMode = (): void => {
-    const { status } = this.#get();
-    const nextZenMode = !status.zenMode;
-
-    this.#get().updateSystemStatus({ zenMode: nextZenMode }, n('toggleZenMode'));
   };
 
   updateModelDetailPanelExpandedKeys = (keys: ModelDetailPanelExpandedKey[]): void => {

@@ -1,7 +1,7 @@
 import type * as LobechatConst from '@lobechat/const';
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const analyticsTrack = vi.fn();
@@ -114,7 +114,12 @@ const renderFooter = async ({
     useAnalytics: createAnalyticsApi,
   }));
   vi.doMock('@/components/ChangelogModal', () => ({
-    default: () => null,
+    default: vi.fn(),
+    openChangelogModal: vi.fn(),
+  }));
+  vi.doMock('@/components/FeedbackModal', () => ({
+    default: vi.fn(),
+    openFeedbackModal: vi.fn(),
   }));
   vi.doMock('@/components/HighlightNotification', () => ({
     default: (props: {
@@ -149,12 +154,6 @@ const renderFooter = async ({
   }));
   vi.doMock('@/features/User/UserPanel/ThemeButton', () => ({
     default: () => null,
-  }));
-  function createFeedbackModalApi() {
-    return { open: vi.fn() };
-  }
-  vi.doMock('@/hooks/useFeedbackModal', () => ({
-    useFeedbackModal: createFeedbackModalApi,
   }));
   function createNavLayoutState() {
     return {
@@ -213,9 +212,9 @@ afterEach(() => {
   vi.doUnmock('@lobechat/const');
   vi.doUnmock('@lobehub/analytics/react');
   vi.doUnmock('@/components/ChangelogModal');
+  vi.doUnmock('@/components/FeedbackModal');
   vi.doUnmock('@/components/HighlightNotification');
   vi.doUnmock('@/features/User/UserPanel/ThemeButton');
-  vi.doUnmock('@/hooks/useFeedbackModal');
   vi.doUnmock('@/hooks/useNavLayout');
   vi.doUnmock('@/store/global');
   vi.doUnmock('@/store/serverConfig');

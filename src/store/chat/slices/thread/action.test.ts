@@ -211,7 +211,7 @@ describe('thread action', () => {
       );
     });
 
-    it('should use main scope messages even when activeThreadId is set (LOBE-5023)', () => {
+    it('should use main scope messages even when activeThreadId is set ()', () => {
       const { result } = renderHook(() => useChatStore());
 
       const mainMessages: UIChatMessage[] = [
@@ -473,7 +473,7 @@ describe('thread action', () => {
         await result.current.refreshThreads();
       });
 
-      expect(mutate).toHaveBeenCalledWith(['SWR_USE_FETCH_THREADS', 'test-topic-id']);
+      expect(mutate).toHaveBeenCalledWith(['thread:list', 'test-topic-id']);
     });
 
     it('should not mutate when activeTopicId is undefined', async () => {

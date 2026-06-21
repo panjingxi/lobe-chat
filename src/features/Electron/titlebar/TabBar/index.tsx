@@ -1,15 +1,25 @@
 'use client';
 
+import {
+  closestCenter,
+  DndContext,
+  type DragEndEvent,
+  KeyboardSensor,
+  type Modifier,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import { horizontalListSortingStrategy, SortableContext } from '@dnd-kit/sortable';
 import { useWatchBroadcast } from '@lobechat/electron-client-ipc';
 import { ActionIcon, ScrollArea } from '@lobehub/ui';
 import { cx } from 'antd-style';
 import { Plus } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
 
-import { usePluginContext } from '@/features/Electron/titlebar/RecentlyViewed/hooks/usePluginContext';
-import { pluginRegistry } from '@/features/Electron/titlebar/RecentlyViewed/plugins';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { usePermission } from '@/hooks/usePermission';
 import { electronSystemService } from '@/services/electron/system';
 import { useElectronStore } from '@/store/electron';
 import { electronStylish } from '@/styles/electron';
@@ -21,44 +31,67 @@ import TabItem from './TabItem';
 const TAB_WIDTH = 180;
 const TAB_GAP = 0;
 
+// The "+" button always opens a fresh Home tab, regardless of the active page.
+const NEW_TAB_URL = '/';
+
+// Tabs only reorder along the horizontal axis, so lock the drag transform to X.
+const restrictToHorizontalAxis: Modifier = ({ transform }) => ({ ...transform, y: 0 });
+
 const TabBar = () => {
   const styles = useStyles;
-  const navigate = useNavigate();
+  const navigate = useWorkspaceAwareNavigate();
   const { t } = useTranslation('electron');
+  const { allowed: canCreate, reason } = usePermission('create_content');
   const viewportRef = useRef<HTMLDivElement>(null);
+  const scrolledActiveTabIdRef = useRef<string | null>(null);
   const { tabs, activeTabId } = useResolvedTabs();
-  const pluginCtx = usePluginContext();
   const activateTab = useElectronStore((s) => s.activateTab);
   const addTab = useElectronStore((s) => s.addTab);
   const removeTab = useElectronStore((s) => s.removeTab);
   const closeOtherTabs = useElectronStore((s) => s.closeOtherTabs);
   const closeLeftTabs = useElectronStore((s) => s.closeLeftTabs);
   const closeRightTabs = useElectronStore((s) => s.closeRightTabs);
+  const reorderTabs = useElectronStore((s) => s.reorderTabs);
+
+  const sensors = useSensors(
+    // Require a small drag distance so a plain click still activates the tab.
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor),
+  );
+
+  const tabIds = useMemo(() => tabs.map((tab) => tab.tab.id), [tabs]);
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+
+      const fromIndex = tabIds.indexOf(active.id as string);
+      const toIndex = tabIds.indexOf(over.id as string);
+      if (fromIndex < 0 || toIndex < 0) return;
+
+      reorderTabs(fromIndex, toIndex);
+    },
+    [tabIds, reorderTabs],
+  );
 
   const handleActivate = useCallback(
     (id: string, url: string) => {
-      // Prioritize updating the Tab activation state (high priority)
       activateTab(id);
-      const tab = tabs.find((t) => t.reference.id === id);
-      if (tab) pluginRegistry.onActivate(tab.reference);
-      // Degrade route navigation to startTransition (low priority)
       startTransition(() => navigate(url));
     },
-    [activateTab, navigate, tabs],
+    [activateTab, navigate],
   );
 
   const navigateToActive = useCallback(() => {
     const { activeTabId: newActiveId, tabs: newTabs } = useElectronStore.getState();
     if (newActiveId) {
-      const target = newTabs.find((t) => t.id === newActiveId);
-      if (target) {
-        const resolved = tabs.find((t) => t.reference.id === newActiveId);
-        if (resolved) navigate(resolved.url);
-      }
+      const target = newTabs.find((tab) => tab.id === newActiveId);
+      if (target) navigate(target.url);
     } else {
       navigate('/');
     }
-  }, [tabs, navigate]);
+  }, [navigate]);
 
   const handleClose = useCallback(
     (id: string) => {
@@ -67,10 +100,8 @@ const TabBar = () => {
 
       startTransition(() => {
         if (isActive && nextActiveId) {
-          const nextTab = tabs.find((t) => t.reference.id === nextActiveId);
-          if (nextTab) {
-            navigate(nextTab.url);
-          }
+          const nextTab = tabs.find((tab) => tab.tab.id === nextActiveId);
+          if (nextTab) navigate(nextTab.tab.url);
         }
 
         if (!nextActiveId) {
@@ -85,8 +116,8 @@ const TabBar = () => {
     (id: string) => {
       closeOtherTabs(id);
       startTransition(() => {
-        const target = tabs.find((t) => t.reference.id === id);
-        if (target) navigate(target.url);
+        const target = tabs.find((tab) => tab.tab.id === id);
+        if (target) navigate(target.tab.url);
       });
     },
     [closeOtherTabs, tabs, navigate],
@@ -112,8 +143,15 @@ const TabBar = () => {
     const viewport = viewportRef.current;
     if (!viewport || !activeTabId) return;
 
-    const activeIndex = tabs.findIndex((t) => t.reference.id === activeTabId);
+    const activeIndex = tabs.findIndex((tab) => tab.tab.id === activeTabId);
     if (activeIndex < 0) return;
+
+    // Only scroll into view when the active tab itself changes. Reordering
+    // background tabs keeps the same active tab, so skip it — otherwise every
+    // drop would yank the viewport back to the active tab and lose the user's
+    // scroll position.
+    if (scrolledActiveTabIdRef.current === activeTabId) return;
+    scrolledActiveTabIdRef.current = activeTabId;
 
     const tabLeft = activeIndex * (TAB_WIDTH + TAB_GAP);
     const tabRight = tabLeft + TAB_WIDTH;
@@ -126,16 +164,6 @@ const TabBar = () => {
     }
   }, [activeTabId, tabs]);
 
-  const activeReference = useMemo(() => {
-    if (!activeTabId) return null;
-    return tabs.find((t) => t.reference.id === activeTabId)?.reference ?? null;
-  }, [activeTabId, tabs]);
-
-  const newTabAction = useMemo(() => {
-    if (!activeReference) return null;
-    return pluginRegistry.getNewTabAction(activeReference, pluginCtx);
-  }, [activeReference, pluginCtx]);
-
   useWatchBroadcast('closeCurrentTabOrWindow', () => {
     if (tabs.length > 1 && activeTabId) {
       handleClose(activeTabId);
@@ -144,28 +172,17 @@ const TabBar = () => {
     }
   });
 
-  const handleNewTab = useCallback(async () => {
-    if (!newTabAction) return;
-    let result;
-    try {
-      result = await newTabAction.onCreate();
-    } catch (error) {
-      console.error('[TabBar] failed to create new tab:', error);
-      return;
-    }
-    if (!result) return;
+  const handleNewTab = useCallback(() => {
+    if (!canCreate) return;
 
-    const { reference, cached } = result;
-    addTab(reference, cached, true);
-    pluginRegistry.onActivate(reference);
-
-    const resolved = pluginRegistry.resolve(reference, pluginCtx);
-    const url = resolved?.url;
-    if (url) startTransition(() => navigate(url));
-  }, [newTabAction, addTab, pluginCtx, navigate]);
+    // Always open a fresh Home tab. If a Home tab already exists, addTab just
+    // activates it instead of stacking duplicates.
+    addTab(NEW_TAB_URL, undefined, true);
+    startTransition(() => navigate(NEW_TAB_URL));
+  }, [canCreate, addTab, navigate]);
 
   useWatchBroadcast('createNewTab', () => {
-    void handleNewTab();
+    handleNewTab();
   });
 
   if (tabs.length === 0) return null;
@@ -178,29 +195,37 @@ const TabBar = () => {
         style: { alignItems: 'center', flexDirection: 'row', gap: TAB_GAP },
       }}
     >
-      {tabs.map((tab, index) => (
-        <TabItem
-          index={index}
-          isActive={tab.reference.id === activeTabId}
-          item={tab}
-          key={tab.reference.id}
-          totalCount={tabs.length}
-          onActivate={handleActivate}
-          onClose={handleClose}
-          onCloseLeft={handleCloseLeft}
-          onCloseOthers={handleCloseOthers}
-          onCloseRight={handleCloseRight}
-        />
-      ))}
-      {newTabAction && (
-        <ActionIcon
-          className={cx(electronStylish.nodrag, styles.newTabButton)}
-          icon={Plus}
-          size="small"
-          title={t('tab.newTab')}
-          onClick={handleNewTab}
-        />
-      )}
+      <DndContext
+        collisionDetection={closestCenter}
+        modifiers={[restrictToHorizontalAxis]}
+        sensors={sensors}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext items={tabIds} strategy={horizontalListSortingStrategy}>
+          {tabs.map((tab, index) => (
+            <TabItem
+              index={index}
+              isActive={tab.tab.id === activeTabId}
+              item={tab}
+              key={tab.tab.id}
+              totalCount={tabs.length}
+              onActivate={handleActivate}
+              onClose={handleClose}
+              onCloseLeft={handleCloseLeft}
+              onCloseOthers={handleCloseOthers}
+              onCloseRight={handleCloseRight}
+            />
+          ))}
+        </SortableContext>
+      </DndContext>
+      <ActionIcon
+        className={cx(electronStylish.nodrag, styles.newTabButton)}
+        disabled={!canCreate}
+        icon={Plus}
+        size="small"
+        title={canCreate ? t('tab.newTab') : reason}
+        onClick={canCreate ? handleNewTab : undefined}
+      />
     </ScrollArea>
   );
 };

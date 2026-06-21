@@ -35,9 +35,12 @@ function createMockStore() {
     internal_dispatchMessage: vi.fn(),
     internal_executeClientTool: vi.fn().mockResolvedValue(undefined),
     internal_toggleToolCallingStreaming: vi.fn(),
-    markUnreadCompleted: vi.fn(),
+    markTopicUnread: vi.fn(),
     operations: {
-      'op-1': { context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' } },
+      'op-1': {
+        context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' },
+        metadata: { startTime: 0 },
+      },
     } as Record<string, any>,
     replaceMessages: vi.fn(),
     startOperation: vi.fn(() => {
@@ -47,6 +50,7 @@ function createMockStore() {
         operationId: `op-reasoning-${reasoningCounter}`,
       };
     }),
+    updateOperationMetadata: vi.fn(),
   };
 }
 
@@ -82,7 +86,7 @@ describe('createGatewayEventHandler', () => {
   });
 
   describe('stream_start', () => {
-    it('should associate new message with operation', async () => {
+    it('should associate new message with operation and skip the DB refetch', async () => {
       const store = createMockStore();
       const handler = createHandler(store);
 
@@ -90,12 +94,19 @@ describe('createGatewayEventHandler', () => {
       await flush();
 
       expect(store.associateMessageWithOperation).toHaveBeenCalledWith('msg-step2', 'op-1');
-      expect(store.replaceMessages).toHaveBeenCalled();
+      // Native gateway streams carry the new assistant id directly + a SoT
+      // uiMessages snapshot on the preceding step_start, so stream_start must
+      // NOT trigger a DB refetch (the refetch is what clobbered the streamed
+      // assistantGroup with a stale placeholder).
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+      expect(store.replaceMessages).not.toHaveBeenCalled();
       expect(emitClientAgentSignalSourceEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           payload: expect.objectContaining({
+            anchorMessageId: 'msg-step2',
             assistantMessageId: 'msg-step2',
             operationId: 'op-1',
+            stepIndex: 0,
           }),
           sourceType: 'client.gateway.stream_start',
         }),
@@ -234,6 +245,44 @@ describe('createGatewayEventHandler', () => {
       await flush();
 
       expect(store.internal_dispatchMessage).not.toHaveBeenCalled();
+    });
+
+    it('should DROP subagent-tagged tool chunks so they do not leak into the main bubble', async () => {
+      // Regression: on a live gateway / remote-CC stream, a subagent (Agent/Task)
+      // inner tool chunk is tagged with `data.subagent`. It belongs to an
+      // isolation Thread, not the main assistant. If dispatched here it appends
+      // to the MAIN assistant's tools[] until the terminal DB refetch corrects it
+      // ("流式时漏出来、结束后正常"). It must be dropped before any dispatch.
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(
+        makeEvent('stream_chunk', {
+          chunkType: 'tools_calling',
+          subagent: { parentToolCallId: 'toolu_agent', subagentMessageId: 'sub-1' },
+          toolsCalling: [{ id: 'inner-1' }],
+        }),
+      );
+      await flush();
+
+      // Not dispatched onto the main assistant, and no tool-calling spinner.
+      expect(store.internal_dispatchMessage).not.toHaveBeenCalled();
+      expect(store.internal_toggleToolCallingStreaming).not.toHaveBeenCalled();
+    });
+
+    it('should still dispatch a NON-subagent tool chunk (drop is scoped to subagent)', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(
+        makeEvent('stream_chunk', { chunkType: 'tools_calling', toolsCalling: [{ id: 'm-1' }] }),
+      );
+      await flush();
+
+      expect(store.internal_dispatchMessage).toHaveBeenCalledWith(
+        { id: 'msg-initial', type: 'updateMessage', value: { tools: [{ id: 'm-1' }] } },
+        { operationId: 'op-1' },
+      );
     });
   });
 
@@ -639,12 +688,84 @@ describe('createGatewayEventHandler', () => {
       expect(emitClientAgentSignalSourceEvent).toHaveBeenLastCalledWith(
         expect.objectContaining({
           payload: expect.objectContaining({
+            anchorMessageId: 'msg-step2',
             assistantMessageId: 'msg-step2',
             operationId: 'op-1',
           }),
           sourceType: 'client.gateway.runtime_end',
         }),
       );
+    });
+
+    // MID-stream cancel. The server-side coordinator skips the
+    // uiMessages snapshot when state.status='interrupted' to avoid pushing
+    // a LOADING_FLAT placeholder. The client must mirror that intent: when
+    // `reason='interrupted'` arrives without uiMessages AND we already have
+    // server-confirmed streamed state, do NOT fall back to a DB refetch —
+    // the executor's partial-finalize catch is still racing to write the
+    // real content, and a fetch here would return placeholder and clobber
+    // in-memory streamed content.
+    it('should NOT refetch from DB when reason=interrupted AND stream had progressed', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      // Simulate a stream that had progressed: server-assigned assistant id
+      // arrived via stream_start, then a text chunk landed.
+      handler(makeEvent('stream_start', { assistantMessage: { id: 'msg-server' } }));
+      handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'partial answer' }));
+      await flush();
+      vi.mocked(messageService.getMessages).mockClear();
+      store.replaceMessages.mockClear();
+
+      handler(makeEvent('agent_runtime_end', { reason: 'interrupted' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+      expect(store.replaceMessages).not.toHaveBeenCalled();
+    });
+
+    // Reviewer feedback on PR #15173: if cancel arrives BEFORE any
+    // stream activity (no server-assigned assistant id, no chunks), the
+    // optimistic `tmp_*` placeholder messages are the only client-side
+    // state and they need the DB refetch to be reconciled with the
+    // server-side rows. Skipping the fallback would leave the tmp_*
+    // ids stuck in the store indefinitely.
+    it('should refetch from DB when reason=interrupted but stream never progressed', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      // No stream_start / stream_chunk before the cancel — only optimistic
+      // local state exists, no server-confirmed assistant id, no chunks.
+      handler(makeEvent('agent_runtime_end', { reason: 'interrupted' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      // Refetch IS called so the tmp_* placeholders get reconciled.
+      expect(messageService.getMessages).toHaveBeenCalled();
+      expect(store.replaceMessages).toHaveBeenCalled();
+    });
+
+    it('should still use uiMessages SoT when reason=interrupted but server included a snapshot', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+      const uiMessages = [{ id: 'msg-initial', role: 'assistant', content: 'partial' }];
+
+      handler(
+        makeEvent('agent_runtime_end', {
+          reason: 'interrupted',
+          uiMessages,
+        }),
+      );
+      await flush();
+
+      // uiMessages present takes precedence over the interrupted skip — the
+      // SoT push is authoritative when server chose to send it.
+      expect(store.replaceMessages).toHaveBeenCalledWith(uiMessages, {
+        action: 'gateway/agent_runtime_end',
+        context: expect.any(Object),
+      });
+      expect(messageService.getMessages).not.toHaveBeenCalled();
     });
   });
 
@@ -840,17 +961,14 @@ describe('createGatewayEventHandler', () => {
   });
 
   describe('sequential processing', () => {
-    it('should process stream_chunk only after stream_start refresh completes', async () => {
+    it('should dispatch stream_chunk to the new assistant id after stream_start switches it', async () => {
+      // Native gateway streams no longer await a DB fetch on stream_start
+      // — but stream_chunk must still queue behind stream_start
+      // so the chunk targets the NEW assistant id (from stream_start.data),
+      // not the previous one.
       const store = createMockStore();
       const callOrder: string[] = [];
 
-      const { messageService } = await import('@/services/message');
-      (messageService.getMessages as any).mockImplementation(async () => {
-        callOrder.push('refresh_start');
-        await new Promise((r) => setTimeout(r, 10));
-        callOrder.push('refresh_end');
-        return [];
-      });
       store.internal_dispatchMessage.mockImplementation(() => {
         callOrder.push('dispatch');
       });
@@ -864,10 +982,34 @@ describe('createGatewayEventHandler', () => {
       handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'Hello' }));
       await flush();
 
-      const refreshEndIdx = callOrder.indexOf('refresh_end');
+      // associate (from stream_start) precedes dispatch (from stream_chunk)
+      const associateIdx = callOrder.indexOf('associate');
       const dispatchIdx = callOrder.indexOf('dispatch');
-      expect(refreshEndIdx).toBeGreaterThan(-1);
-      expect(dispatchIdx).toBeGreaterThan(refreshEndIdx);
+      expect(associateIdx).toBeGreaterThan(-1);
+      expect(dispatchIdx).toBeGreaterThan(associateIdx);
+
+      // Chunk targets the new id, proving the queue ordering held
+      expect(store.internal_dispatchMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: 'msg-new', value: { content: 'Hello' } }),
+        { operationId: 'op-1' },
+      );
+      // And no DB refetch was issued for the native stream
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+    });
+
+    it('should still fetch from DB on stream_start when assistantMessage id is absent (hetero CLI)', async () => {
+      // Hetero CLI adapters (Claude Code / Codex) never set
+      // `assistantMessage.id` on stream_start, so the DB read is still
+      // mandatory — it pulls the executor-created placeholder into
+      // `dbMessagesMap` so subsequent chunks have a target.
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(makeEvent('stream_start', {}));
+      await flush();
+
+      expect(messageService.getMessages).toHaveBeenCalled();
+      expect(store.replaceMessages).toHaveBeenCalled();
     });
   });
 
@@ -898,18 +1040,22 @@ describe('createGatewayEventHandler', () => {
       // Loading stays active between steps — only tool streaming is cleared
       expect(store.internal_toggleToolCallingStreaming).toHaveBeenCalledWith('msg-1', undefined);
 
-      // Tool execution
+      // Tool execution — tool_end still refreshes from DB to pick up the
+      // server-created tool message row.
       handler(makeEvent('tool_start', { parentMessageId: 'msg-1', toolCalling: tools[0] }));
       handler(makeEvent('tool_end', { isSuccess: true }));
       await flush();
       expect(store.replaceMessages).toHaveBeenCalled();
 
-      // Step 2: Next LLM call with new assistant message
+      // Step 2: Next LLM call with new assistant message — native stream_start
+      // carries the id directly, so it must NOT trigger a DB refetch
+      // Only the association switch happens.
       vi.clearAllMocks();
       handler(makeEvent('stream_start', { assistantMessage: { id: 'msg-2' } }));
       await flush();
-      expect(store.replaceMessages).toHaveBeenCalled();
       expect(store.associateMessageWithOperation).toHaveBeenCalledWith('msg-2', 'op-1');
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+      expect(store.replaceMessages).not.toHaveBeenCalled();
 
       handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'Here are the results.' }));
       await flush();
@@ -922,6 +1068,241 @@ describe('createGatewayEventHandler', () => {
       handler(makeEvent('agent_runtime_end'));
       await flush();
       expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+    });
+  });
+
+  // ─── Characterization net (LOCKS CURRENT BEHAVIOR for an upcoming
+  // lifecycle refactor). These tests must PASS against the code as-is.
+  // They describe what the gateway terminal path does NOW, not ideal
+  // behavior. If something reads like a bug it is locked as-is with a note.
+  describe('gateway terminal characterization (lifecycle refactor regression net)', () => {
+    // CURRENT BEHAVIOR (gatewayEventHandler.ts ~622-624): the `error` event
+    // handler completes the operation but, UNLIKE `agent_runtime_end`
+    // (~552-557 which calls markTopicUnread when the operation has a
+    // context.agentId), the error path NEVER calls markTopicUnread.
+    // This is an intentional asymmetry to lock: an errored run does not get
+    // marked as an unread "completed" agent run. If a future refactor unifies
+    // the terminal paths, revisit whether errors SHOULD mark unread —
+    // changing this assertion is the signal that the contract moved.
+    it('error event completes the operation but does NOT call markTopicUnread (asymmetry vs agent_runtime_end)', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(makeEvent('error', { message: 'kaboom' }));
+      await flush();
+
+      // completeOperation IS called on error.
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      // markTopicUnread is NOT — even though operations['op-1'] has a
+      // context.agentId (which WOULD trigger it on agent_runtime_end).
+      expect(store.markTopicUnread).not.toHaveBeenCalled();
+    });
+
+    it('error event preserves runtime payload errorType and budget context', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+      const budget = { required: 12 };
+
+      handler(
+        makeEvent('error', {
+          budget,
+          error: { message: 'Budget exceeded' },
+          errorType: 'FreePlanLimit',
+          provider: 'lobehub',
+        }),
+      );
+      await flush();
+
+      expect(messageService.updateMessageError).toHaveBeenCalledWith(
+        'msg-initial',
+        expect.objectContaining({
+          body: expect.objectContaining({
+            budget,
+            message: 'Budget exceeded',
+            provider: 'lobehub',
+          }),
+          message: 'Budget exceeded',
+          type: 'FreePlanLimit',
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('error event preserves _responseBody while merging payload error metadata', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(
+        makeEvent('error', {
+          _responseBody: {
+            error: { message: 'Payment required' },
+            provider: 'lobehub',
+          },
+          error: { status: 402 },
+          errorType: 'ProviderBizError',
+        }),
+      );
+      await flush();
+
+      expect(messageService.updateMessageError).toHaveBeenCalledWith(
+        'msg-initial',
+        expect.objectContaining({
+          body: expect.objectContaining({
+            error: { message: 'Payment required', status: 402 },
+            message: 'Payment required',
+            provider: 'lobehub',
+          }),
+          message: 'Payment required',
+          type: 'ProviderBizError',
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('error event preserves normalized body fields for trace-id error UI', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(
+        makeEvent('error', {
+          body: {
+            message: 'Upstream failed',
+            traceId: 'trace-123',
+          },
+          error: 'Upstream failed',
+          errorType: 'ProviderBizError',
+          phase: 'llm_execution',
+        }),
+      );
+      await flush();
+
+      expect(messageService.updateMessageError).toHaveBeenCalledWith(
+        'msg-initial',
+        expect.objectContaining({
+          body: expect.objectContaining({
+            message: 'Upstream failed',
+            traceId: 'trace-123',
+          }),
+          message: 'Upstream failed',
+          type: 'ProviderBizError',
+        }),
+        expect.anything(),
+      );
+    });
+
+    // Contrast probe: agent_runtime_end on the SAME operation (which has a
+    // context.agentId) DOES mark unread completed — proving the negative
+    // assertion above is the error path's own behavior, not a missing agentId.
+    it('agent_runtime_end (same op, has context.agentId) DOES call markTopicUnread', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(makeEvent('agent_runtime_end'));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      expect(store.markTopicUnread).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'agent-1', topicId: 'topic-1' }),
+      );
+    });
+
+    it.each(['interrupted', 'waiting_for_async_tool'])(
+      'agent_runtime_end with reason "%s" completes the op but does NOT mark unread (cancel/park)',
+      async (reason) => {
+        const store = createMockStore();
+        const handler = createHandler(store);
+
+        handler(makeEvent('agent_runtime_end', { reason }));
+        await flush();
+
+        expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+        expect(store.markTopicUnread).not.toHaveBeenCalled();
+      },
+    );
+
+    // CURRENT BEHAVIOR: completeOperation runs once in the agent_runtime_end
+    // handler (gatewayEventHandler.ts:552) and again in gateway.ts
+    // onSessionComplete (gateway.ts:532) for the same operationId. The
+    // underlying reducer (operation/actions.ts:281-306) is idempotent: a
+    // second completeOperation on an already-'completed' op leaves status as
+    // 'completed' (it only refuses to overwrite a 'cancelled' status). This
+    // models the real reducer so the double-call is locked as a no-throw,
+    // no-flip stable terminal state.
+    it('completeOperation is idempotent: double-calling the same op leaves status=completed (no throw, no flip)', async () => {
+      // Local harness whose completeOperation MIRRORS the real reducer
+      // (operation/actions.ts completeOperation): set status to 'completed'
+      // unless the op was 'cancelled'.
+      const operations: Record<string, any> = {
+        'op-1': {
+          context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' },
+          metadata: { startTime: 0 },
+          status: 'running',
+        },
+      };
+      const completeOperation = vi.fn((operationId: string) => {
+        const op = operations[operationId];
+        if (!op) return;
+        if (op.status !== 'cancelled') op.status = 'completed';
+        op.metadata.endTime = Date.now();
+      });
+      const store = {
+        ...createMockStore(),
+        completeOperation,
+        operations,
+      } as ReturnType<typeof createMockStore>;
+      const get = vi.fn(() => store) as any;
+      const handler = createGatewayEventHandler(get, {
+        assistantMessageId: 'msg-initial',
+        context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' } as any,
+        operationId: 'op-1',
+      });
+
+      // First terminal completion (agent_runtime_end handler).
+      handler(makeEvent('agent_runtime_end'));
+      await flush();
+      expect(operations['op-1'].status).toBe('completed');
+
+      // Second completion (as onSessionComplete in gateway.ts would issue).
+      store.completeOperation('op-1');
+      expect(operations['op-1'].status).toBe('completed');
+      expect(completeOperation).toHaveBeenCalledTimes(2);
+    });
+
+    // CURRENT BEHAVIOR: if the op was cancelled mid-flight, completeOperation
+    // does NOT flip it to 'completed' (operation/actions.ts:288-291 preserves
+    // the user's interruption state). Lock this so the refactor can't quietly
+    // resurrect a cancelled op into 'completed' on a stray terminal event.
+    it('completeOperation preserves a cancelled op (does not flip cancelled → completed)', async () => {
+      const operations: Record<string, any> = {
+        'op-1': {
+          context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' },
+          metadata: { startTime: 0 },
+          status: 'cancelled',
+        },
+      };
+      const completeOperation = vi.fn((operationId: string) => {
+        const op = operations[operationId];
+        if (!op) return;
+        if (op.status !== 'cancelled') op.status = 'completed';
+        op.metadata.endTime = Date.now();
+      });
+      const store = {
+        ...createMockStore(),
+        completeOperation,
+        operations,
+      } as ReturnType<typeof createMockStore>;
+      const get = vi.fn(() => store) as any;
+      const handler = createGatewayEventHandler(get, {
+        assistantMessageId: 'msg-initial',
+        context: { agentId: 'agent-1', scope: 'session', topicId: 'topic-1' } as any,
+        operationId: 'op-1',
+      });
+
+      handler(makeEvent('agent_runtime_end', { reason: 'interrupted' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      expect(operations['op-1'].status).toBe('cancelled');
     });
   });
 
@@ -965,6 +1346,136 @@ describe('createGatewayEventHandler', () => {
       );
       expect(toolsDispatch).toBeDefined();
       expect(toolsDispatch![0].id).toBe('ast-new');
+    });
+  });
+
+  describe('waiting_for_async_tool parked characterization (lifecycle refactor regression net)', () => {
+    // CURRENT BEHAVIOR (gatewayEventHandler.ts:568-589): the `agent_runtime_end`
+    // message-reconciliation branch special-cases BOTH `reason='interrupted'`
+    // and `reason='waiting_for_async_tool'` together, gated by
+    // `hasStreamedContent`. A `waiting_for_async_tool` terminal is a deferred-
+    // tool PAUSE (the run parks waiting for an out-of-band async tool result),
+    // and the server's `AgentRuntimeCoordinator.resolveUiMessages` deliberately
+    // omits the uiMessages snapshot for this status. These tests lock the exact
+    // client-side reconciliation the refactor must preserve.
+
+    // (1) Parked WITH streamed content → preserve in-memory streamed content.
+    // When the run parks after some server-confirmed state has landed
+    // (server-assigned assistant id from stream_start + a text chunk), the
+    // handler does NOT refetch from DB and does NOT replace messages — the
+    // executor's partial-finalize catch is still racing to write the real
+    // content, so a fetch here would clobber it with the LOADING placeholder.
+    // This mirrors the `interrupted` skip exactly (same branch).
+    it('should NOT refetch from DB when reason=waiting_for_async_tool AND stream had progressed (preserves streamed content)', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      // Simulate a stream that had progressed: server-assigned assistant id
+      // arrived via stream_start, then a text chunk landed (hasStreamedContent).
+      handler(makeEvent('stream_start', { assistantMessage: { id: 'msg-server' } }));
+      handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'partial answer' }));
+      await flush();
+      vi.mocked(messageService.getMessages).mockClear();
+      store.replaceMessages.mockClear();
+
+      handler(makeEvent('agent_runtime_end', { reason: 'waiting_for_async_tool' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      // Streamed content is preserved: no DB read, no replace.
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+      expect(store.replaceMessages).not.toHaveBeenCalled();
+    });
+
+    // (2) Parked WITHOUT streamed content → fall back to DB refetch.
+    // If the run parks BEFORE any server-confirmed state landed (no
+    // stream_start id, no chunks → hasStreamedContent stays false), the
+    // `(interrupted || waiting_for_async_tool) && hasStreamedContent` guard is
+    // false, so control falls to the `else` DB-refetch branch. This reconciles
+    // the optimistic tmp_* placeholders against server rows. CURRENT BEHAVIOR —
+    // verified: the refetch DOES fire here.
+    it('should refetch from DB when reason=waiting_for_async_tool but stream never progressed', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      // No stream_start / stream_chunk before the park — hasStreamedContent
+      // is still false.
+      handler(makeEvent('agent_runtime_end', { reason: 'waiting_for_async_tool' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      // Refetch IS called (falls through to the else branch).
+      expect(messageService.getMessages).toHaveBeenCalled();
+      expect(store.replaceMessages).toHaveBeenCalled();
+    });
+
+    // (3) uiMessages SoT still wins for a parked terminal. The
+    // `Array.isArray(data?.uiMessages)` branch is checked FIRST (line 563),
+    // BEFORE the `waiting_for_async_tool && hasStreamedContent` skip. So if a
+    // server build DOES attach a snapshot on the park event, it takes
+    // precedence over the preserve-streamed-content skip, even though the
+    // stream had progressed.
+    it('should use uiMessages SoT when reason=waiting_for_async_tool but server included a snapshot (precedence over the skip)', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+      const uiMessages = [{ id: 'msg-server', role: 'assistant', content: 'partial' }];
+
+      // Make the stream progress so hasStreamedContent is true — proving the
+      // uiMessages branch wins even when the skip branch would otherwise apply.
+      handler(makeEvent('stream_start', { assistantMessage: { id: 'msg-server' } }));
+      handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'partial' }));
+      await flush();
+      vi.mocked(messageService.getMessages).mockClear();
+      store.replaceMessages.mockClear();
+
+      handler(makeEvent('agent_runtime_end', { reason: 'waiting_for_async_tool', uiMessages }));
+      await flush();
+
+      expect(store.replaceMessages).toHaveBeenCalledWith(uiMessages, {
+        action: 'gateway/agent_runtime_end',
+        context: expect.any(Object),
+      });
+      expect(messageService.getMessages).not.toHaveBeenCalled();
+    });
+
+    // (4) Operation lifecycle on the parked terminal. A `waiting_for_async_tool`
+    // park still completes the operation and tears down tool-calling streaming,
+    // but it must NOT mark the topic unread — a park is not a finished
+    // generation, and persisting it as `unread` would leave a stale badge on a
+    // run that's only paused waiting for an async tool. (See `isCompletedRuntimeEnd`.)
+    it('completes the operation but does NOT mark unread on a waiting_for_async_tool park', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(makeEvent('stream_start', { assistantMessage: { id: 'msg-server' } }));
+      handler(makeEvent('stream_chunk', { chunkType: 'text', content: 'partial' }));
+      await flush();
+
+      handler(makeEvent('agent_runtime_end', { reason: 'waiting_for_async_tool' }));
+      await flush();
+
+      // The parked terminal still completes the op + tears down tool streaming,
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      expect(store.internal_toggleToolCallingStreaming).toHaveBeenCalledWith(
+        'msg-server',
+        undefined,
+      );
+      // …but does NOT surface an unread badge for the pause.
+      expect(store.markTopicUnread).not.toHaveBeenCalled();
+    });
+
+    // (5) Contrast probe: the no-mark behavior is driven by the park `reason`,
+    // not by whether content streamed — a parked terminal with NO streamed
+    // content also skips the unread mark.
+    it('does NOT mark unread on a waiting_for_async_tool park even with NO streamed content', async () => {
+      const store = createMockStore();
+      const handler = createHandler(store);
+
+      handler(makeEvent('agent_runtime_end', { reason: 'waiting_for_async_tool' }));
+      await flush();
+
+      expect(store.completeOperation).toHaveBeenCalledWith('op-1');
+      expect(store.markTopicUnread).not.toHaveBeenCalled();
     });
   });
 });

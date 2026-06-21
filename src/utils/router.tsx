@@ -1,21 +1,18 @@
 'use client';
 
-import { ThemeProvider } from '@lobehub/ui';
+import { ConfigProvider, ThemeProvider } from '@lobehub/ui';
+import * as m from 'motion/react-m';
 import { type ComponentType, type ReactElement } from 'react';
 import { lazy, memo, Suspense, useLayoutEffect } from 'react';
-import type { RouteObject } from 'react-router-dom';
-import {
-  createBrowserRouter,
-  Navigate,
-  Outlet,
-  useNavigate,
-  useRouteError,
-} from 'react-router-dom';
+import type { RouteObject } from 'react-router';
+import { createBrowserRouter, Navigate, Outlet, useNavigate, useRouteError } from 'react-router';
 
 import BusinessGlobalProvider from '@/business/client/BusinessGlobalProvider';
 import ErrorCapture from '@/components/Error';
 import Loading from '@/components/Loading/BrandTextLoading';
+import { useIsDark } from '@/hooks/useIsDark';
 import SPAGlobalProvider from '@/layout/SPAGlobalProvider';
+import AppLayer from '@/spa/AppLayer';
 import { useGlobalStore } from '@/store/global';
 import { createNavigationRef } from '@/store/global/initialState';
 import { isChunkLoadError, notifyChunkError } from '@/utils/chunkError';
@@ -98,14 +95,23 @@ export interface ErrorBoundaryProps {
 
 export const ErrorBoundary = ({ resetPath }: ErrorBoundaryProps) => {
   const error = useRouteError() as Error;
+  const isDark = useIsDark();
+  const appearance = isDark ? 'dark' : 'light';
 
   if (typeof window !== 'undefined' && isChunkLoadError(error)) {
     notifyChunkError();
   }
 
   return (
-    <ThemeProvider theme={{ cssVar: { key: 'lobe-vars' } }}>
-      <ErrorCapture error={error} resetPath={resetPath} />
+    <ThemeProvider
+      appearance={appearance}
+      defaultAppearance={appearance}
+      defaultThemeMode={appearance}
+      theme={{ cssVar: { key: 'lobe-vars' } }}
+    >
+      <ConfigProvider motion={m}>
+        <ErrorCapture error={error} resetPath={resetPath} />
+      </ConfigProvider>
     </ThemeProvider>
   );
 };
@@ -135,7 +141,9 @@ const RouterRoot = memo(() => (
   <SPAGlobalProvider>
     <BusinessGlobalProvider>
       <NavigatorRegistrar />
-      <Outlet />
+      <AppLayer>
+        <Outlet />
+      </AppLayer>
     </BusinessGlobalProvider>
   </SPAGlobalProvider>
 ));
@@ -172,30 +180,4 @@ export function createAppRouter(routes: RouteObject[], options?: CreateAppRouter
  */
 export function redirectElement(to: string): ReactElement {
   return <Navigate replace to={to} />;
-}
-
-/**
- * Prefetch route layout chunks on hover to reduce navigation delay.
- * Each import is only triggered once — subsequent calls are no-ops.
- */
-const prefetchedRoutes = new Set<string>();
-
-const routePrefetchMap: Record<string, () => Promise<unknown>> = {
-  '/agent': () => import('@/routes/(main)/agent/_layout'),
-  '/community': () => import('@/routes/(main)/community/_layout'),
-  '/group': () => import('@/routes/(main)/group/_layout'),
-  '/page': () => import('@/routes/(main)/page/_layout'),
-  '/resource': () => import('@/routes/(main)/resource/_layout'),
-  '/settings': () => import('@/routes/(main)/settings/_layout'),
-};
-
-export function prefetchRoute(path: string): void {
-  // Match the first path segment, e.g. "/settings/provider" -> "/settings"
-  const key = '/' + path.replace(/^\//, '').split('/')[0];
-  if (prefetchedRoutes.has(key)) return;
-  const loader = routePrefetchMap[key];
-  if (loader) {
-    prefetchedRoutes.add(key);
-    loader();
-  }
 }

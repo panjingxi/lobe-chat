@@ -12,6 +12,8 @@ declare module '../types' {
 
 const log = debug('context-engine:provider:AgentBuilderContextInjector');
 
+const SYSTEM_ROLE_CONTEXT_PREVIEW_LENGTH = 10_000;
+
 /**
  * Official tool item for Agent Builder context
  */
@@ -26,8 +28,8 @@ export interface OfficialToolItem {
   installed?: boolean;
   /** Tool display name */
   name: string;
-  /** Tool type: 'builtin' for built-in tools, 'klavis' for LobeHub Mcp servers, 'lobehub-skill' for LobeHub Skill providers */
-  type: 'builtin' | 'klavis' | 'lobehub-skill';
+  /** Tool type: 'builtin' for built-in tools, 'composio' for LobeHub Mcp servers, 'lobehub-skill' for LobeHub Skill providers */
+  type: 'builtin' | 'composio' | 'lobehub-skill';
 }
 
 /**
@@ -53,7 +55,7 @@ export interface AgentBuilderContext {
     tags?: string[];
     title?: string;
   };
-  /** Available official tools (builtin tools, Klavis integrations, and LobehubSkill providers) */
+  /** Available official tools (builtin tools, Composio integrations, and LobehubSkill providers) */
   officialTools?: OfficialToolItem[];
 }
 
@@ -112,13 +114,13 @@ const defaultFormatAgentContext = (context: AgentBuilderContext): string => {
       configFields.push(`  <openingQuestions>\n${questions}\n  </openingQuestions>`);
     }
     if (context.config.systemRole) {
-      // For system role, show preview (first 500 chars) to avoid too long context
-      const preview =
-        context.config.systemRole.length > 500
-          ? context.config.systemRole.slice(0, 500) + '...'
+      const systemRole =
+        context.config.systemRole.length > SYSTEM_ROLE_CONTEXT_PREVIEW_LENGTH
+          ? `${context.config.systemRole.slice(0, SYSTEM_ROLE_CONTEXT_PREVIEW_LENGTH)}...`
           : context.config.systemRole;
+
       configFields.push(
-        `  <systemRole length="${context.config.systemRole.length}">${escapeXml(preview)}</systemRole>`,
+        `  <systemRole length="${context.config.systemRole.length}">${escapeXml(systemRole)}</systemRole>`,
       );
     }
 
@@ -130,7 +132,7 @@ const defaultFormatAgentContext = (context: AgentBuilderContext): string => {
   // Add official tools section
   if (context.officialTools && context.officialTools.length > 0) {
     const builtinTools = context.officialTools.filter((t) => t.type === 'builtin');
-    const klavisTools = context.officialTools.filter((t) => t.type === 'klavis');
+    const composioTools = context.officialTools.filter((t) => t.type === 'composio');
     const lobehubSkillTools = context.officialTools.filter((t) => t.type === 'lobehub-skill');
 
     const toolsSections: string[] = [];
@@ -148,8 +150,8 @@ const defaultFormatAgentContext = (context: AgentBuilderContext): string => {
       toolsSections.push(`  <builtin_tools>\n${builtinItems}\n  </builtin_tools>`);
     }
 
-    if (klavisTools.length > 0) {
-      const klavisItems = klavisTools
+    if (composioTools.length > 0) {
+      const composioItems = composioTools
         .map((t) => {
           const attrs = [
             `id="${t.identifier}"`,
@@ -160,7 +162,7 @@ const defaultFormatAgentContext = (context: AgentBuilderContext): string => {
           return `    <tool ${attrs}>${escapeXml(t.name)}${desc}</tool>`;
         })
         .join('\n');
-      toolsSections.push(`  <klavis_tools>\n${klavisItems}\n  </klavis_tools>`);
+      toolsSections.push(`  <composio_tools>\n${composioItems}\n  </composio_tools>`);
     }
 
     if (lobehubSkillTools.length > 0) {
@@ -190,7 +192,7 @@ const defaultFormatAgentContext = (context: AgentBuilderContext): string => {
   }
 
   return `<current_agent_context>
-<instruction>This is the current agent's configuration context. Use this information when the user asks about or wants to modify agent settings. Use togglePlugin to enable/disable tools, or installPlugin to install new tools (including builtin tools, Klavis servers, and LobehubSkill providers).</instruction>
+<instruction>This is the current agent's configuration context. Use this information when the user asks about or wants to modify agent settings. Use togglePlugin to enable/disable tools, or installPlugin to install new tools (including builtin tools, Composio servers, and LobehubSkill providers).</instruction>
 ${parts.join('\n')}
 </current_agent_context>`;
 };

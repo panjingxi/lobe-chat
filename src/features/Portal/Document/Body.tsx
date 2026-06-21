@@ -1,21 +1,37 @@
 'use client';
 
+import { EDITOR_DEBOUNCE_TIME, EDITOR_MAX_WAIT } from '@lobechat/const';
 import { ActionIcon, Button, Flexbox, Text, TextArea } from '@lobehub/ui';
 import { createStaticStyles, cssVar } from 'antd-style';
+import { debounce } from 'es-toolkit/compat';
 import { CheckIcon, PencilIcon, XIcon } from 'lucide-react';
 import type { ChangeEvent } from 'react';
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { useChatStore } from '@/store/chat';
-import { chatPortalSelectors } from '@/store/chat/selectors';
+import CodeEditorPane from '@/components/CodeEditorPane';
+import FloatingChatPanel from '@/features/FloatingChatPanel';
+import { useDocumentChatTopic } from '@/features/FloatingChatPanel/useDocumentChatTopic';
+import WideScreenContainer from '@/features/WideScreenContainer';
+import { useClientDataSWR } from '@/libs/swr';
+import { portalKeys } from '@/libs/swr/keys';
+import { documentService } from '@/services/document';
+import { useAgentStore } from '@/store/agent';
 import { useDocumentStore } from '@/store/document';
+import { useUserStore } from '@/store/user';
+import { labPreferSelectors } from '@/store/user/selectors';
+import { getDocumentRenderMode } from '@/utils/documentRenderMode';
 import {
   getSkillMarkdownMetadataError,
   parseSkillMarkdownFrontmatterFields,
   parseSkillMarkdownMetadata,
 } from '@/utils/skillMarkdown';
 
+import {
+  useDocumentViewFullPage,
+  useResolvedAgentDocumentId,
+  useResolvedDocumentId,
+} from './documentViewContext';
 import EditorCanvas from './EditorCanvas';
 import TodoList from './TodoList';
 
@@ -24,6 +40,11 @@ const styles = createStaticStyles(({ css }) => ({
     overflow: auto;
     flex: 1;
     padding-inline: 16px;
+  `,
+  contentFull: css`
+    /* Width is handled by WideScreenContainer; keep only the scroll host. */
+    overflow: auto;
+    flex: 1;
   `,
   frontmatter: css`
     margin-block: 16px 12px;
@@ -190,8 +211,127 @@ const SkillFrontmatterBlock = memo<SkillFrontmatterBlockProps>(({ documentId, fr
   );
 });
 
+interface HighlightEditorProps {
+  content: string;
+  documentId: string;
+  language: string;
+  onSaved: (newContent: string) => void;
+}
+
+const HighlightEditor = memo<HighlightEditorProps>(({ content, documentId, language, onSaved }) => {
+  const [buffer, setBuffer] = useState<string | undefined>(undefined);
+  const editingValue = buffer ?? content;
+
+  const bufferRef = useRef(buffer);
+  const documentIdRef = useRef(documentId);
+  const onSavedRef = useRef(onSaved);
+  bufferRef.current = buffer;
+  documentIdRef.current = documentId;
+  onSavedRef.current = onSaved;
+
+  const writeBuffer = useCallback(async (source: 'manual' | 'autosave') => {
+    const toWrite = bufferRef.current;
+    if (toWrite === undefined) return;
+    try {
+      await documentService.updateDocument({
+        content: toWrite,
+        id: documentIdRef.current,
+        saveSource: source,
+      });
+      // Update SWR cache before clearing the buffer so the editor's value prop
+      // never falls back to stale content, which would otherwise reset the cursor.
+      onSavedRef.current(toWrite);
+      if (bufferRef.current === toWrite) setBuffer(undefined);
+    } catch (error) {
+      console.error('[HighlightEditor] save failed:', error);
+    }
+  }, []);
+
+  const debouncedAutoSave = useMemo(
+    () =>
+      debounce(() => writeBuffer('autosave'), EDITOR_DEBOUNCE_TIME, {
+        leading: false,
+        maxWait: EDITOR_MAX_WAIT,
+        trailing: true,
+      }),
+    [writeBuffer],
+  );
+
+  const handleChange = useCallback(
+    (next: string) => {
+      const isDirty = next !== content;
+      setBuffer(isDirty ? next : undefined);
+      if (isDirty) debouncedAutoSave();
+      else debouncedAutoSave.cancel();
+    },
+    [content, debouncedAutoSave],
+  );
+
+  const handleSave = useCallback(async () => {
+    debouncedAutoSave.cancel();
+    await writeBuffer('manual');
+  }, [debouncedAutoSave, writeBuffer]);
+
+  const isMountedRef = useRef(false);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      debouncedAutoSave.cancel();
+      const pendingContent = bufferRef.current;
+      if (pendingContent === undefined) return;
+      const pendingDocumentId = documentIdRef.current;
+      // Defer the fire-and-forget save to a microtask so that StrictMode's synchronous
+      // unmount/remount in development does not trigger a save. If the component is
+      // immediately remounted, isMountedRef flips back to true before this runs.
+      queueMicrotask(() => {
+        if (isMountedRef.current) return;
+        void documentService.updateDocument({
+          content: pendingContent,
+          id: pendingDocumentId,
+          saveSource: 'autosave',
+        });
+      });
+    };
+  }, [debouncedAutoSave]);
+
+  useEffect(() => {
+    const handler = (event: BeforeUnloadEvent) => {
+      if (bufferRef.current === undefined) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
+
+  return (
+    <CodeEditorPane
+      language={language}
+      style={{ minHeight: '100%' }}
+      value={editingValue}
+      onChange={handleChange}
+      onSave={handleSave}
+    />
+  );
+});
+
+HighlightEditor.displayName = 'HighlightEditor';
+
 const DocumentBody = memo(() => {
-  const documentId = useChatStore(chatPortalSelectors.portalDocumentId);
+  const documentId = useResolvedDocumentId();
+  const agentDocumentId = useResolvedAgentDocumentId();
+  const fullPage = useDocumentViewFullPage();
+  const activeAgentId = useAgentStore((s) => s.activeAgentId);
+  const enableFloatingChatPanel = useUserStore(
+    labPreferSelectors.enableAgentDocumentFloatingChatPanel,
+  );
+  const panelEligible = !fullPage && enableFloatingChatPanel && !!activeAgentId && !!documentId;
+  const { topicId: docChatTopicId } = useDocumentChatTopic({
+    agentId: panelEligible ? activeAgentId : undefined,
+    documentId: panelEligible ? documentId : undefined,
+  });
   const [skillFrontmatter, contentFormat] = useDocumentStore((s) =>
     documentId
       ? [s.documents[documentId]?.skillFrontmatter ?? '', s.documents[documentId]?.contentFormat]
@@ -199,15 +339,61 @@ const DocumentBody = memo(() => {
   );
   const isSkillMarkdown = contentFormat === 'skillMarkdown';
 
+  const { data: documentMeta, mutate: mutateDocumentMeta } = useClientDataSWR(
+    documentId ? portalKeys.documentHeader(documentId) : null,
+    () => documentService.getDocumentById(documentId!),
+  );
+  const renderMode = documentMeta
+    ? getDocumentRenderMode(documentMeta)
+    : { mode: 'editor' as const };
+
+  const handleHighlightSaved = useCallback(
+    (saved: string) => {
+      mutateDocumentMeta((prev) => (prev ? { ...prev, content: saved } : prev), {
+        revalidate: false,
+      });
+    },
+    [mutateDocumentMeta],
+  );
+
+  const editorContent = (
+    <>
+      {documentId && isSkillMarkdown && (
+        <SkillFrontmatterBlock documentId={documentId} frontmatter={skillFrontmatter} />
+      )}
+      {renderMode.mode === 'highlight' && documentId ? (
+        <HighlightEditor
+          content={documentMeta?.content ?? ''}
+          documentId={documentId}
+          key={documentId}
+          language={renderMode.language}
+          onSaved={handleHighlightSaved}
+        />
+      ) : (
+        <EditorCanvas />
+      )}
+    </>
+  );
+
   return (
     <Flexbox flex={1} height={'100%'} style={{ overflow: 'hidden' }}>
-      <div className={styles.content}>
-        {documentId && isSkillMarkdown && (
-          <SkillFrontmatterBlock documentId={documentId} frontmatter={skillFrontmatter} />
-        )}
-        <EditorCanvas />
+      <div className={fullPage ? styles.contentFull : styles.content}>
+        {fullPage ? <WideScreenContainer>{editorContent}</WideScreenContainer> : editorContent}
       </div>
       <TodoList />
+      {/* The full-page route hosts its own panel through `AgentDocumentPage`, so
+          the in-portal panel only renders for the compact view. Both call sites
+          drive a doc-anchored chat topic via `useDocumentChatTopic`, so the panel
+          renders once that topic id resolves. */}
+      {panelEligible && docChatTopicId && (
+        <FloatingChatPanel
+          agentDocumentId={agentDocumentId}
+          agentId={activeAgentId}
+          documentId={documentId ?? undefined}
+          key={`${activeAgentId}:${docChatTopicId}:${documentId ?? 'none'}`}
+          topicId={docChatTopicId}
+        />
+      )}
     </Flexbox>
   );
 });
